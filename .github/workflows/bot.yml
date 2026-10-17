@@ -22,7 +22,8 @@ concurrency:
 
 jobs:
   revisar:
-    runs-on: ubuntu-latest
+    # Versión fija: "ubuntu-latest" cambia de sistema sin aviso y podría romper el bot.
+    runs-on: ubuntu-24.04
     timeout-minutes: 6
     env:
       # Clave para cifrar el historial: el Secret CLAVE_ESTADO si existe; si no,
