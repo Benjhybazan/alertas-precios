@@ -6,7 +6,7 @@ name: Bot de ofertas
 #    servidores) antes de revisar. Así no depende del cron de GitHub, que desde
 #    agosto de 2026 a veces no dispara o llega con horas de retraso.
 #  * Cron: respaldo; si la cadena se corta, la reinicia cuando GitHub lo lance.
-#    La tarea local de la PC también la reinicia si ve que lleva >15 min parada.
+#    Si la nube lleva >20 min parada, la tarea local de la PC avisa por Telegram.
 on:
   schedule:
     # Si el repositorio fuera PRIVADO (2.000 min/mes), usa "7,37 * * * *" y quita la cadena.
