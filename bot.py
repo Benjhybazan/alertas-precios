@@ -15,7 +15,6 @@ Uso:
 
 import argparse
 import html
-import json
 import math
 import os
 import re
@@ -143,8 +142,6 @@ def ejecutar(args):
         return 1
     token = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
     chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
-    if args.local:
-        reanimar_nube()
     if args.local and not token:
         token, chat_id = leer_token_local()
         if not token:
@@ -177,6 +174,8 @@ def ejecutar(args):
             log("Falta TELEGRAM_TOKEN: modo prueba (solo se muestran las alertas).")
     # En modo prueba no se guarda nada, para no dar por avisadas alertas no enviadas.
     guardar = tg is not None
+    if args.local and tg:
+        vigilar_nube(tg, est, ahora)
     # Repositorio privado: 2.000 minutos gratis al mes y GitHub cobra cada
     # ejecución redondeando al minuto, así que cada ejecución dura < 1 minuto.
     privado = os.environ.get("REPO_PRIVADO", "").strip().lower() == "true"
@@ -277,30 +276,42 @@ def chat_de_la_nube(token, est):
     return chat or None
 
 
-def reanimar_nube():
-    """Modo --local: si la nube lleva más de 15 min sin revisar (GitHub perdió un
-    disparo y se cortó la cadena), la vuelve a lanzar con GitHub CLI."""
+def vigilar_nube(tg, est, ahora):
+    """Modo --local: si la nube lleva más de 20 min sin revisar (GitHub perdió la
+    cadena), avisa una vez por Telegram con un botón para reanudarla. Usa la
+    consulta pública de GitHub: no necesita credenciales de GitHub en la PC."""
     repo = config.PRIVADA.get("repo_nube")
-    gh = shutil.which("gh") or os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
-                                            "GitHubCLI", "bin", "gh.exe")
-    if not repo or not os.path.exists(gh):
+    if not repo:
         return
     try:
-        r = subprocess.run([gh, "run", "list", "--repo", repo, "--workflow", "bot.yml",
-                            "--limit", "5", "--json", "status,createdAt"],
-                           capture_output=True, text=True, timeout=60)
-        ejecuciones = json.loads(r.stdout or "[]")
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+        r = httpx.get(f"https://api.github.com/repos/{repo}/actions/workflows/bot.yml/runs",
+                      params={"per_page": 5}, timeout=30,
+                      headers={"Accept": "application/vnd.github+json"})
+        r.raise_for_status()
+        ejecuciones = r.json().get("workflow_runs") or []
+    except (httpx.HTTPError, ValueError, AttributeError):
         return
-    if any(e.get("status") in ("queued", "in_progress", "waiting", "pending", "requested")
-           for e in ejecuciones):
+    if not isinstance(ejecuciones, list) or not ejecuciones:
         return
-    ultima = max((datetime.fromisoformat(e["createdAt"].replace("Z", "+00:00")).timestamp()
-                  for e in ejecuciones if e.get("createdAt")), default=0)
-    if time.time() - ultima > 15 * 60:
-        subprocess.run([gh, "workflow", "run", "bot.yml", "--repo", repo, "--ref", "main",
-                        "-f", "encadenado=true"], capture_output=True, timeout=60)
-        log("La nube llevaba más de 15 min sin revisar: se reactivó.")
+    activa = any(e.get("status") in ("queued", "in_progress", "waiting", "pending", "requested")
+                 for e in ejecuciones)
+    ultima = max(datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")).timestamp()
+                 for e in ejecuciones if e.get("created_at"))
+    parada = not activa and ahora - ultima > 20 * 60
+    if parada and not est.get("aviso_nube"):
+        try:
+            tg.enviar_texto(
+                "⚠️ La revisión en la nube se detuvo (GitHub no lanzó la siguiente). "
+                "Pulsa el botón, luego <b>Run workflow</b> y otra vez <b>Run workflow</b> "
+                "para reanudarla.",
+                botones={"inline_keyboard": [[{"text": "▶️ Reanudar en GitHub",
+                                               "url": f"https://github.com/{repo}/actions/workflows/bot.yml"}]]})
+            est["aviso_nube"] = int(ahora)
+            log("La nube estaba detenida: se avisó por Telegram.")
+        except ErrorTelegram as e:
+            log(f"Telegram: {e}")
+    elif not parada:
+        est.pop("aviso_nube", None)
 
 
 def preparar_local():
