@@ -9,6 +9,8 @@ Uso:
   python bot.py --chat-id          muestra el chat id de quien escribió al bot
   python bot.py --probar-telegram  envía un mensaje de prueba con botón
   python bot.py --solo CLAVE       revisa solo una tienda (su clave en la configuración)
+  python bot.py --local            revisa en esta PC las tiendas marcadas "solo_local"
+                                   (lo usa la tarea programada de Windows)
 """
 
 import argparse
@@ -16,11 +18,16 @@ import html
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+
+import httpx
 
 import config
 from ofertas import analisis, estado
@@ -30,6 +37,9 @@ from ofertas.tiendas import crear_tiendas
 from ofertas.tiendas.base import slug
 
 RUTA_ESTADO = os.environ.get("RUTA_ESTADO", os.path.join("datos", "estado.json.gz"))
+DIR_BOT = os.path.dirname(os.path.abspath(__file__))
+# Modo --local: el token se lee de este archivo (excluido de git).
+ARCHIVO_TOKEN_LOCAL = os.path.join(DIR_BOT, "telegram_token.txt")
 
 # Repositorio público: tiempo máximo para enviar alertas; lo que no alcance
 # queda pendiente para la siguiente ejecución (GitHub corta el trabajo a los 6 min).
@@ -132,9 +142,19 @@ def ejecutar(args):
         return 1
     token = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
     chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    if args.local and not token:
+        token, chat_id = leer_token_local()
     est = estado.cargar(RUTA_ESTADO)
     tg = None
     if not args.sin_telegram:
+        if args.local and token and not chat_id:
+            # El chat vinculado está en el historial cifrado de la nube.
+            chat_id = est.get("dueno_chat") or chat_de_la_nube(token, est)
+            if not chat_id:
+                log("No se encontró el chat vinculado. Escribe /start al bot y espera la "
+                    "siguiente revisión de la nube, o pon tu chat id en la 2.ª línea de "
+                    "telegram_token.txt.")
+                return 1
         if token and not chat_id:
             # Sin TELEGRAM_CHAT_ID: se usa el chat que se vinculó con /start.
             chat_id = est.get("dueno_chat") or vincular_dueno(token, est)
@@ -161,6 +181,12 @@ def ejecutar(args):
         limite_descarga, limite_total = None, inicio + PRESUPUESTO_SEGUNDOS
 
     tiendas = crear_tiendas(config.TIENDAS)
+    # "solo_local": tiendas que bloquean a los servidores en la nube y se revisan
+    # desde la PC del usuario (modo --local); la nube no las intenta.
+    if args.local:
+        tiendas = [t for t in tiendas if t.cfg.get("solo_local")]
+    elif os.environ.get("GITHUB_ACTIONS"):
+        tiendas = [t for t in tiendas if not t.cfg.get("solo_local")]
     if args.solo:
         tiendas = [t for t in tiendas if t.clave == args.solo]
     nombres = {t.clave: t.nombre for t in tiendas}
@@ -184,7 +210,7 @@ def ejecutar(args):
         enviadas = enviar_alertas(tg, alertas, nombres, est, ahora, limite=limite_total)
         tiendas_ok = actualizar_salud(tg, est, resultados, nombres, ahora)
         est["ejecuciones"].append([int(ahora), len(productos), enviadas, tiendas_ok, len(tiendas)])
-        if tg:
+        if tg and not args.local:  # comandos y resumen los atiende la nube
             try:
                 resumen_diario(tg, est, nombres, ahora)
                 atender_comandos(tg, est, nombres, ahora)
@@ -202,6 +228,61 @@ def ejecutar(args):
             log(f"Estado guardado ({len(est['productos'])} productos en historial)")
     # Si ninguna tienda revisada respondió, la ejecución se marca como fallida en GitHub.
     return 0 if tiendas_ok or not activas else 1
+
+
+def leer_token_local():
+    """Modo --local: token (1.ª línea) y, opcional, chat id (2.ª línea)."""
+    try:
+        with open(ARCHIVO_TOKEN_LOCAL, encoding="utf-8-sig") as f:
+            lineas = [l.strip() for l in f.read().splitlines() if l.strip()]
+    except OSError:
+        return "", ""
+    return (lineas[0] if lineas else ""), (lineas[1] if len(lineas) > 1 else "")
+
+
+def chat_de_la_nube(token, est):
+    """Modo --local: toma el chat vinculado del historial que guarda la nube
+    (rama pública "estado", cifrada con el token del bot)."""
+    repo = config.PRIVADA.get("repo_nube")
+    openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+    if not repo or not os.path.exists(openssl):
+        return None
+    try:
+        r = httpx.get(f"https://raw.githubusercontent.com/{repo}/estado/estado.enc", timeout=30)
+        r.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    chat = None
+    with tempfile.TemporaryDirectory() as carpeta:
+        cifrado, plano = os.path.join(carpeta, "e.enc"), os.path.join(carpeta, "e.json.gz")
+        with open(cifrado, "wb") as f:
+            f.write(r.content)
+        for clave in (token, token + "\n"):  # por si el Secret se guardó con salto de línea
+            res = subprocess.run([openssl, "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter",
+                                  "200000", "-pass", "env:CLAVE_ESTADO", "-in", cifrado,
+                                  "-out", plano], env={**os.environ, "CLAVE_ESTADO": clave},
+                                 capture_output=True)
+            if res.returncode == 0:
+                chat = estado.cargar(plano).get("dueno_chat")
+                if chat:
+                    break
+    if chat:
+        est["dueno_chat"] = chat
+    return chat or None
+
+
+def preparar_local():
+    """Modo --local: estado propio de esta PC y, sin consola (tarea programada),
+    registro en datos/local.log."""
+    global RUTA_ESTADO
+    carpeta = os.path.join(DIR_BOT, "datos")
+    os.makedirs(carpeta, exist_ok=True)
+    RUTA_ESTADO = os.path.join(carpeta, "estado_local.json.gz")
+    if sys.stdout is None:
+        registro = os.path.join(carpeta, "local.log")
+        if os.path.exists(registro) and os.path.getsize(registro) > 1_000_000:
+            os.replace(registro, registro + ".1")
+        sys.stdout = sys.stderr = open(registro, "a", encoding="utf-8", buffering=1)
 
 
 def vincular_dueno(token, est):
@@ -508,8 +589,12 @@ def main():
     parser.add_argument("--chat-id", action="store_true", help="muestra tu TELEGRAM_CHAT_ID")
     parser.add_argument("--probar-telegram", action="store_true", help="envía un mensaje de prueba")
     parser.add_argument("--solo", help="revisa solo esta tienda (su clave en la configuración)")
+    parser.add_argument("--local", action="store_true",
+                        help='revisa en esta PC las tiendas marcadas "solo_local"')
     args = parser.parse_args()
-    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    if args.local:
+        preparar_local()
+    if sys.stdout and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if args.chat_id:
         return mostrar_chat_id()

@@ -6,5 +6,6 @@ salida/
 
 # Privado: nunca se sube
 config_privada.json
+telegram_token.txt
 GUIA.md
 tests/
