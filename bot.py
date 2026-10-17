@@ -15,6 +15,7 @@ Uso:
 
 import argparse
 import html
+import json
 import math
 import os
 import re
@@ -142,6 +143,8 @@ def ejecutar(args):
         return 1
     token = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
     chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    if args.local:
+        reanimar_nube()
     if args.local and not token:
         token, chat_id = leer_token_local()
         if not token:
@@ -272,6 +275,32 @@ def chat_de_la_nube(token, est):
     if chat:
         est["dueno_chat"] = chat
     return chat or None
+
+
+def reanimar_nube():
+    """Modo --local: si la nube lleva más de 15 min sin revisar (GitHub perdió un
+    disparo y se cortó la cadena), la vuelve a lanzar con GitHub CLI."""
+    repo = config.PRIVADA.get("repo_nube")
+    gh = shutil.which("gh") or os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
+                                            "GitHubCLI", "bin", "gh.exe")
+    if not repo or not os.path.exists(gh):
+        return
+    try:
+        r = subprocess.run([gh, "run", "list", "--repo", repo, "--workflow", "bot.yml",
+                            "--limit", "5", "--json", "status,createdAt"],
+                           capture_output=True, text=True, timeout=60)
+        ejecuciones = json.loads(r.stdout or "[]")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return
+    if any(e.get("status") in ("queued", "in_progress", "waiting", "pending", "requested")
+           for e in ejecuciones):
+        return
+    ultima = max((datetime.fromisoformat(e["createdAt"].replace("Z", "+00:00")).timestamp()
+                  for e in ejecuciones if e.get("createdAt")), default=0)
+    if time.time() - ultima > 15 * 60:
+        subprocess.run([gh, "workflow", "run", "bot.yml", "--repo", repo, "--ref", "main",
+                        "-f", "encadenado=true"], capture_output=True, timeout=60)
+        log("La nube llevaba más de 15 min sin revisar: se reactivó.")
 
 
 def preparar_local():
