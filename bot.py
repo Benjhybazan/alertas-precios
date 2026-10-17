@@ -144,6 +144,9 @@ def ejecutar(args):
     chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     if args.local and not token:
         token, chat_id = leer_token_local()
+        if not token:
+            log("Falta el token: pégalo en telegram_token.txt (carpeta del bot).")
+            return 1
     est = estado.cargar(RUTA_ESTADO)
     tg = None
     if not args.sin_telegram:
