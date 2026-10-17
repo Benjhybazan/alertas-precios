@@ -1,0 +1,149 @@
+name: Bot de ofertas
+
+on:
+  schedule:
+    # Cada 5 minutos (el mínimo que permite GitHub). En un repositorio público
+    # los minutos son ilimitados. En horas de mucha carga GitHub puede
+    # retrasar o saltarse alguna ejecución.
+    # Si el repositorio fuera PRIVADO (2.000 min/mes), usa "7,37 * * * *".
+    - cron: "*/5 * * * *"
+  # Permite ejecutarlo a mano desde la pestaña Actions (botón "Run workflow").
+  workflow_dispatch:
+
+permissions:
+  contents: write  # guardar el historial (cifrado) en la rama "estado"
+  actions: write   # mantener activo el cron programado
+
+# Nunca dos ejecuciones a la vez: la siguiente espera a que termine la actual
+# (así el historial no se pisa).
+concurrency:
+  group: bot-ofertas
+  cancel-in-progress: false
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      # Clave para cifrar el historial: el Secret CLAVE_ESTADO si existe; si no,
+      # el token del bot (si cambias el token, el historial empieza de cero).
+      CLAVE_ESTADO: ${{ secrets.CLAVE_ESTADO || secrets.TELEGRAM_TOKEN }}
+    steps:
+      - name: Comprobar configuración
+        id: secretos
+        env:
+          TIENE_CONFIGURACION: ${{ secrets.CONFIGURACION != '' }}
+          TIENE_TOKEN: ${{ secrets.TELEGRAM_TOKEN != '' }}
+        # Mientras falten los Secrets, el bot espera sin fallar (así GitHub no
+        # envía correos de error cada 5 minutos).
+        run: |
+          if [ "$TIENE_CONFIGURACION" = "true" ] && [ "$TIENE_TOKEN" = "true" ]; then
+            echo "listo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "listo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Faltan los Secrets CONFIGURACION y/o TELEGRAM_TOKEN: el bot espera sin revisar tiendas."
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.secretos.outputs.listo == 'true'
+
+      - name: Detectar si el repositorio es privado
+        id: repo
+        if: steps.secretos.outputs.listo == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # En privado el bot limita cada ejecución a menos de 1 minuto; en
+        # público oculta los detalles en los registros. Si falla, asume privado.
+        run: |
+          privado=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .private 2>/dev/null || echo true)
+          echo "privado=${privado}" >> "$GITHUB_OUTPUT"
+          echo "Repositorio privado: ${privado}"
+
+      - uses: actions/setup-python@v7
+        if: steps.secretos.outputs.listo == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        if: steps.secretos.outputs.listo == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Recuperar estado
+        id: recuperar
+        if: steps.secretos.outputs.listo == 'true'
+        run: |
+          if [ -z "$CLAVE_ESTADO" ]; then
+            echo "::error::Falta el Secret CLAVE_ESTADO (sirve para cifrar el historial)."
+            exit 1
+          fi
+          mkdir -p datos
+          set +e
+          git ls-remote --exit-code --heads origin estado > /dev/null
+          existe=$?
+          set -e
+          if [ "$existe" = "2" ]; then
+            echo "Primera ejecución: todavía no hay estado guardado"
+            exit 0
+          fi
+          # La rama existe (o no se pudo consultar): hay que recuperarla sí o sí.
+          # Si falla, el paso falla y NO se sobrescribe el historial.
+          for intento in 1 2 3; do
+            git fetch --depth=1 origin estado && break
+            [ "$intento" = "3" ] && exit 1
+            sleep 5
+          done
+          git show FETCH_HEAD:estado.enc > datos/estado.enc
+          if openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE_ESTADO \
+               -in datos/estado.enc -out datos/estado.json.gz 2>/dev/null; then
+            echo "Estado recuperado"
+          else
+            echo "::warning::No se pudo descifrar el historial (¿cambió CLAVE_ESTADO?). Se empieza de cero."
+            rm -f datos/estado.json.gz
+          fi
+          rm -f datos/estado.enc
+
+      - name: Revisar tiendas y enviar alertas
+        if: steps.secretos.outputs.listo == 'true'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Configuración privada (tiendas, direcciones, categorías, umbrales).
+          CONFIGURACION: ${{ secrets.CONFIGURACION }}
+          REPO_PRIVADO: ${{ steps.repo.outputs.privado }}
+        run: python bot.py
+
+      - name: Guardar estado
+        # Solo si el estado anterior se recuperó bien (nunca se pisa el
+        # historial con uno vacío) y el bot llegó a escribir el archivo.
+        if: always() && steps.recuperar.outcome == 'success' && hashFiles('datos/estado.json.gz') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # El historial se cifra: aunque la rama sea pública, nadie puede leerlo.
+          # Rama "estado" con un único commit que se reemplaza en cada
+          # ejecución: el repositorio no crece con el tiempo.
+          mkdir -p salida
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CLAVE_ESTADO \
+            -in datos/estado.json.gz -out salida/estado.enc
+          cd salida
+          git init -q -b estado
+          git config user.name "bot-ofertas"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add estado.enc
+          git commit -qm "Estado $(date -u +%Y-%m-%dT%H:%MZ)"
+          for intento in 1 2 3; do
+            git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" estado && exit 0
+            sleep 5
+          done
+          exit 1
+
+      - name: Mantener activo el cron
+        # GitHub desactiva los cron de repositorios públicos sin actividad en
+        # 60 días; volver a habilitar el flujo por la API lo evita. En
+        # repositorios privados no hace falta.
+        if: github.event_name == 'schedule' && steps.repo.outputs.privado != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/bot.yml/enable"
