@@ -164,16 +164,20 @@ def ejecutar(args):
     if args.solo:
         tiendas = [t for t in tiendas if t.clave == args.solo]
     nombres = {t.clave: t.nombre for t in tiendas}
+    # Tiendas que bloquearon al bot: no se insiste hasta que termine su pausa.
+    en_pausa = [t for t in tiendas if est["salud"].get(t.clave, {}).get("pausa_hasta", 0) > ahora]
+    activas = [t for t in tiendas if t not in en_pausa]
     tiendas_ok = 0
     try:
-        resultados = descargar(tiendas, est, limite_descarga)
+        resultados = descargar(activas, est, limite_descarga)
         log(f"Descarga terminada en {time.monotonic() - inicio:.0f} s")
         productos, linea_base = unificar(resultados, est, nombres, ahora)
         con_datos = sum(1 for r in resultados.values() if r["lecturas"])
         con_errores = sum(1 for r in resultados.values() if r["errores"])
         log(f"Tiendas con datos: {con_datos} de {len(resultados)}"
             + (f" · {con_errores} con errores (detalle: /estado en Telegram)"
-               if con_errores and DISCRETO else ""))
+               if con_errores and DISCRETO else "")
+            + (f" · {len(en_pausa)} en pausa por bloqueo" if en_pausa else ""))
         alertas = elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes=guardar)
         log(f"{len(productos)} productos analizados, {len(alertas)} alertas nuevas")
 
@@ -196,8 +200,8 @@ def ejecutar(args):
             estado.podar(est, ahora)
             estado.guardar(est, RUTA_ESTADO)
             log(f"Estado guardado ({len(est['productos'])} productos en historial)")
-    # Si ninguna tienda respondió, la ejecución se marca como fallida en GitHub.
-    return 0 if tiendas_ok or not tiendas else 1
+    # Si ninguna tienda revisada respondió, la ejecución se marca como fallida en GitHub.
+    return 0 if tiendas_ok or not activas else 1
 
 
 def vincular_dueno(token, est):
@@ -365,6 +369,17 @@ def actualizar_salud(tg, est, resultados, nombres, ahora):
         s["fallos"] = s.get("fallos", 0) + 1
         s["error"] = (errores or ["sin datos"])[0][:200]
         s.setdefault("desde", int(ahora))
+        bloqueo = next((m.group(0) for e in errores if (m := re.search(r"HTTP (403|429)", e))), None)
+        if bloqueo:
+            # La tienda rechaza al bot: se respeta y solo se reintenta tras una pausa.
+            s["pausa_hasta"] = int(ahora + config.PAUSA_TRAS_BLOQUEO_HORAS * 3600)
+            s["bloqueo"] = bloqueo
+            if not s.get("avisado") and tg:
+                avisar(tg, f"⏸️ <b>{nombres[clave]}</b> está bloqueando al bot ({bloqueo}). No se "
+                           f"insistirá: se reintenta cada {config.PAUSA_TRAS_BLOQUEO_HORAS} horas y "
+                           "te aviso si vuelve a responder. Las demás tiendas siguen normales.")
+                s["avisado"] = True
+            continue
         if s["fallos"] >= config.FALLOS_PARA_AVISAR and not s.get("avisado") and tg:
             avisar(tg, f"⚠️ <b>{nombres[clave]}</b> no responde desde las {hora_lima(s['desde'])} "
                        f"({s['fallos']} revisiones seguidas).\nÚltimo error: {html.escape(s['error'])}")
@@ -409,7 +424,10 @@ def texto_estado(est, nombres, ahora):
     lineas.append("\n<b>Tiendas</b>")
     for clave, nombre in nombres.items():
         s = est["salud"].get(clave, {})
-        if s.get("fallos"):
+        if s.get("pausa_hasta", 0) > ahora:
+            lineas.append(f"⏸️ {nombre}: bloquea al bot ({s.get('bloqueo', '')}); próximo intento "
+                          f"a las {hora_lima(s['pausa_hasta'])}")
+        elif s.get("fallos"):
             lineas.append(f"⚠️ {nombre}: falla desde las {hora_lima(s.get('desde'))} — "
                           f"{html.escape(s.get('error', '')[:80])}")
         elif s.get("ok"):

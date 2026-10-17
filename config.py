@@ -80,6 +80,8 @@ HORA_RESUMEN_DIARIO = _num("HORA_RESUMEN_DIARIO", 9)
 
 # Avisar si una tienda falla en esta cantidad de ejecuciones seguidas.
 FALLOS_PARA_AVISAR = 3
+# Si una tienda bloquea al bot (HTTP 403/429), se pausa estas horas antes de reintentar.
+PAUSA_TRAS_BLOQUEO_HORAS = 6
 # Productos no vistos en estos días se borran del historial.
 DIAS_RETENCION = 21
 
