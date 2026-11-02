@@ -75,6 +75,8 @@ DIAS_DESCUENTO_PERMANENTE = _num("DIAS_DESCUENTO_PERMANENTE", 3)
 BAJADA_PARA_REAVISAR = _num("BAJADA_PARA_REAVISAR", 0.05)
 # Alertas con foto por ejecución; el resto va en un mensaje resumen.
 MAX_ALERTAS_POR_EJECUCION = _num("MAX_ALERTAS_POR_EJECUCION", 10)
+# Descuento a partir del cual una oferta llega sola (con foto), sea o no de tus intereses.
+DESCUENTO_PRIORITARIO = _num("DESCUENTO_PRIORITARIO", 0.88)
 # Resumen diario "el bot sigue vivo" (hora de Lima, 0-23). -1 lo desactiva.
 HORA_RESUMEN_DIARIO = _num("HORA_RESUMEN_DIARIO", 9)
 
@@ -109,3 +111,6 @@ TIMEOUT_SEGUNDOS = 30
 # Tiendas: solo en la configuración privada
 # ---------------------------------------------------------------------------
 TIENDAS = PRIVADA.get("tiendas") or {}
+# Intereses: {"nombre": regex, "fuente": regex}. Lo que coincide llega con foto;
+# lo demás, en un mensaje-lista. Sin intereses, todo llega con foto.
+INTERESES = PRIVADA.get("intereses") or {}

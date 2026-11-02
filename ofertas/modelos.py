@@ -22,6 +22,8 @@ class Producto:
     # Precio por debajo del cual el producto se considera anormalmente bajo
     # (solo para fuentes con "piso" configurado y nombre que coincide).
     piso: float | None = None
+    # Id de la página/consulta donde apareció (sirve para saber su categoría).
+    origen: str = ""
 
     @property
     def clave(self) -> str:

@@ -31,7 +31,7 @@ import httpx
 
 import config
 from ofertas import analisis, estado
-from ofertas.red import Descargador, ErrorDescarga
+from ofertas.red import SIN_VENTANA, Descargador, ErrorDescarga
 from ofertas.telegram import LIMA, ErrorTelegram, Telegram, hora_lima, soles, texto_alerta
 from ofertas.tiendas import crear_tiendas
 from ofertas.tiendas.base import slug
@@ -266,7 +266,7 @@ def chat_de_la_nube(token, est):
             res = subprocess.run([openssl, "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter",
                                   "200000", "-pass", "env:CLAVE_ESTADO", "-in", cifrado,
                                   "-out", plano], env={**os.environ, "CLAVE_ESTADO": clave},
-                                 capture_output=True)
+                                 capture_output=True, creationflags=SIN_VENTANA)
             if res.returncode == 0:
                 chat = estado.cargar(plano).get("dueno_chat")
                 if chat:
@@ -387,6 +387,7 @@ def unificar(resultados, est, nombres, ahora):
         for fuente, ps in r["lecturas"]:
             nueva = fuente.id not in est["fuentes"]
             for p in ps:
+                p.origen = p.origen or fuente.id
                 if p.clave not in productos:
                     productos[p.clave] = p
                     linea_base[p.clave] = nueva
@@ -425,6 +426,29 @@ def elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes):
     return alertas
 
 
+_RE_INTERES = {}
+
+
+def es_de_interes(p):
+    """¿Coincide con tus intereses (por nombre o por la categoría donde apareció)?"""
+    if not config.INTERESES:
+        return True
+    for campo, texto in (("nombre", p.nombre), ("fuente", p.origen)):
+        patron = config.INTERESES.get(campo)
+        if patron:
+            if campo not in _RE_INTERES:
+                _RE_INTERES[campo] = re.compile(patron, re.I)
+            if _RE_INTERES[campo].search(texto or ""):
+                return True
+    return False
+
+
+def es_prioritaria(p, ev):
+    """Llega sola, con foto: tus intereses, descuentos enormes o posibles errores."""
+    return (es_de_interes(p) or ev.ahorro_pct >= config.DESCUENTO_PRIORITARIO
+            or ev.nivel == analisis.ERROR)
+
+
 def marcar_avisado(est, p, ev, ahora):
     est_p = est["productos"][p.clave]
     est_p["a"] = {"t": int(ahora), "p": p.precio, "n": ev.nivel}
@@ -433,10 +457,14 @@ def marcar_avisado(est, p, ev, ahora):
 
 
 def enviar_alertas(tg, alertas, nombres, est, ahora, limite):
-    """Las mejores alertas van con foto y botón; el resto, en un mensaje resumen.
-    Las que no se logren enviar quedan pendientes ("pend") para la siguiente vez."""
-    individuales = alertas[:config.MAX_ALERTAS_POR_EJECUCION]
-    resto = alertas[config.MAX_ALERTAS_POR_EJECUCION:]
+    """Tus intereses, los descuentos enormes y los posibles errores van con foto y
+    botón; el resto, juntos en un mensaje-lista. Las que no se logren enviar
+    quedan pendientes ("pend") para la siguiente vez."""
+    prioritarias = [a for a in alertas if es_prioritaria(*a)]
+    otras = [a for a in alertas if not es_prioritaria(*a)]
+    individuales = prioritarias[:config.MAX_ALERTAS_POR_EJECUCION]
+    resto = sorted(prioritarias[config.MAX_ALERTAS_POR_EJECUCION:] + otras,
+                   key=lambda a: -a[1].ahorro_pct)
     enviadas = 0
     for p, ev in individuales:
         if tg is None:
@@ -457,11 +485,11 @@ def enviar_alertas(tg, alertas, nombres, est, ahora, limite):
                 return enviadas  # Telegram no responde: no insistir con el resto
     if not resto:
         return enviadas
-    lineas = [f"{ev.titulo.split()[0]} <b>-{ev.ahorro_pct:.0%}</b> {soles(p.precio)} · "
-              f"<a href=\"{html.escape(p.url)}\">{html.escape(p.nombre[:70])}</a> "
-              f"({nombres[p.tienda]})"
+    lineas = [f"<b>-{ev.ahorro_pct:.0%}</b> {soles(p.precio)} · "
+              f"<a href=\"{html.escape(p.url)}\">{html.escape(p.nombre[:60])}</a> "
+              f"<i>{nombres[p.tienda]}</i>"
               for p, ev in resto]
-    encabezado = f"➕ <b>Otras {len(resto)} ofertas detectadas en esta revisión:</b>"
+    encabezado = f"📋 <b>Otras ofertas ({len(resto)})</b>"
     if tg is None:
         print(sin_html(encabezado + "\n" + "\n".join(lineas)))
         return enviadas + len(resto)

@@ -9,6 +9,10 @@ import httpx
 import config
 
 
+# En Windows, evita que cada llamada a curl abra una ventana de consola.
+SIN_VENTANA = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 class ErrorDescarga(Exception):
     def __init__(self, mensaje, codigo=None):
         super().__init__(mensaje)
@@ -86,6 +90,7 @@ class Descargador:
              "-H", "Accept-Language: es-PE,es;q=0.9",
              "-w", marca + "%{http_code}", url],
             capture_output=True, timeout=config.TIMEOUT_SEGUNDOS + 10,
+            creationflags=SIN_VENTANA,
         )
         salida = proc.stdout.decode("utf-8", errors="replace")
         if proc.returncode != 0 and marca not in salida:
