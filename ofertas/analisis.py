@@ -12,7 +12,7 @@ from ofertas.modelos import Producto
 
 ERROR, EXTREMA, GRANDE = 3, 2, 1
 TITULOS = {
-    ERROR: "🚨 POSIBLE ERROR DE PRECIO",
+    ERROR: "🚨 ¿ERROR DE PRECIO?",
     EXTREMA: "🔥 OFERTA EXTREMA",
     GRANDE: "⚡ GRAN OFERTA",
 }
@@ -31,6 +31,8 @@ class Evaluacion:
     habitual: float | None
     referencia: float         # precio con el que se calcula el ahorro
     motivos: list[str] = field(default_factory=list)
+    minimo: float | None = None   # precio más bajo visto en los 30 días previos
+    veredicto: str = ""           # una línea: ¿es de verdad el mejor precio?
 
     @property
     def ahorro_pct(self) -> float:
@@ -74,6 +76,18 @@ def analizar_historial(h: list | None, precio: float, ahora: float):
     return pesos[-1][0], dias
 
 
+def minimo_previo(h: list | None, precio: float, ahora: float) -> float | None:
+    """Precio más bajo visto en los 30 días previos, sin contar el precio actual
+    (detecta la trampa de subir el precio y luego "rebajarlo" al de antes)."""
+    if not h:
+        return None
+    tramos = h[:-1] if _mismo_precio(h[-1][1], precio) else h
+    desde = ahora - VENTANA_HISTORIAL
+    precios = [p for i, (inicio, p, *_) in enumerate(tramos)
+               if (tramos[i + 1][0] if i + 1 < len(tramos) else ahora) >= desde]
+    return min(precios) if precios else None
+
+
 def registrar(est: dict, p: Producto, ahora: float):
     aviso = est.get("a")
     if aviso and (p.precio > aviso["p"] * 1.15 or ahora - aviso["t"] > DIAS_AVISO * DIA):
@@ -95,6 +109,7 @@ def evaluar(p: Producto, h: list | None, ahora: float) -> Evaluacion | None:
         return None
 
     habitual, dias_mismo_precio = analizar_historial(h, p.precio, ahora)
+    minimo = minimo_previo(h, p.precio, ahora)
     descuento = 1 - p.precio / p.precio_antes if p.precio_antes else 0.0
     caida = 1 - p.precio / habitual if habitual and habitual > p.precio else 0.0
     desc_tarjeta = (1 - p.precio_tarjeta / p.precio_antes
@@ -112,6 +127,8 @@ def evaluar(p: Producto, h: list | None, ahora: float) -> Evaluacion | None:
     # es prácticamente el de siempre, aunque la tienda muestre un "antes" alto.
     if habitual is not None and caida < 0.15 and not bajo_piso:
         return None
+    # Precio inflado y "rebajado": hace poco estuvo más barato que ahora.
+    inflado = bool(minimo and p.precio > minimo * 1.05)
     # Descuento permanente: lleva días con el mismo precio, ya no es novedad.
     if dias_mismo_precio >= config.DIAS_DESCUENTO_PERMANENTE and not bajo_piso:
         return None
@@ -125,16 +142,15 @@ def evaluar(p: Producto, h: list | None, ahora: float) -> Evaluacion | None:
     # Señales de posible error de precio
     if descuento >= config.DESCUENTO_ERROR:
         nivel = ERROR
-        motivos.append(f"Descuento de {descuento:.0%} sobre el precio anterior")
     if tipeo:
         nivel = ERROR
-        motivos.append(f"El precio es ~{round(proporcion)} veces menor: posible dígito o coma de menos")
+        motivos.append(f"🔢 Posible coma o dígito de menos (~{round(proporcion)}× más barato)")
     if caida >= 0.75:
         nivel = ERROR
-        motivos.append(f"Cayó {caida:.0%} frente a su precio habitual (S/ {habitual:,.2f})")
+        motivos.append(f"📉 {caida:.0%} bajo su precio habitual")
     if bajo_piso:
         nivel = ERROR
-        motivos.append(f"Precio anormalmente bajo para su categoría (menos de S/ {p.piso:,.0f})")
+        motivos.append(f"🎯 Precio absurdo para su tipo (piso S/ {p.piso:,.0f})")
 
     corroborado = tipeo or caida >= config.MIN_CAIDA_HISTORIAL or bajo_piso
     if p.marketplace and nivel == ERROR and not corroborado:
@@ -145,29 +161,33 @@ def evaluar(p: Producto, h: list | None, ahora: float) -> Evaluacion | None:
         nivel = EXTREMA
     if nivel < GRANDE and (descuento >= config.MIN_DESCUENTO or caida >= config.MIN_CAIDA_HISTORIAL):
         nivel = GRANDE
+    if inflado and nivel < ERROR:
+        # Trampa típica de CyberWow: no es más barato que hace unos días.
+        return None
     if nivel == 0 or nivel < config.NIVEL_MINIMO:
         return None
     if p.marketplace and not corroborado and descuento < config.MIN_DESCUENTO_MARKETPLACE:
         return None
 
-    if not motivos:
-        if descuento:
-            motivos.append(f"Descuento de {descuento:.0%} sobre el precio anterior")
-        if caida >= config.MIN_CAIDA_HISTORIAL:
-            motivos.append(f"Bajó {caida:.0%} frente a su precio habitual (S/ {habitual:,.2f})")
-    if habitual and caida >= 0.15 and descuento:
-        motivos.append(f"Bajada real confirmada: antes se vendía a S/ {habitual:,.2f}")
-    elif habitual is None:
-        motivos.append("Producto nuevo para el bot (sin historial para confirmar)")
+    # Veredicto en una línea, según el historial del bot.
+    if inflado:
+        veredicto = f"⚠️ Hace poco estuvo a S/ {minimo:,.2f}"
+    elif minimo and p.precio <= minimo * 1.01:
+        veredicto = "✅ Precio más bajo de los últimos 30 días"
+    elif habitual and caida >= 0.15:
+        veredicto = f"✅ Bajada real: solía costar S/ {habitual:,.2f}"
+    else:
+        veredicto = "🆕 Sin historial previo para comparar"
     if p.marketplace:
-        motivos.append("Vendido por un tercero (marketplace): revisa al vendedor")
+        motivos.append("🏪 Vendedor externo")
     if p.stock is not None and 0 < p.stock <= config.POCAS_UNIDADES:
-        motivos.append(f"Quedan pocas unidades: {p.stock}")
+        motivos.append(f"⏳ Quedan pocas unidades: {p.stock}")
     for etiqueta in p.etiquetas:
-        motivos.append(f"Etiqueta de la tienda: {etiqueta}")
+        motivos.append(f"🏷️ {etiqueta}")
 
     return Evaluacion(nivel=nivel, descuento=descuento, caida=caida, habitual=habitual,
-                      referencia=referencia, motivos=motivos)
+                      referencia=referencia, motivos=motivos, minimo=minimo,
+                      veredicto=veredicto)
 
 
 def es_novedad(p: Producto, ev: Evaluacion, est: dict | None, linea_base: bool) -> bool:

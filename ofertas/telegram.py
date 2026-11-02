@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+import config
 from ofertas.analisis import Evaluacion
 from ofertas.modelos import Producto
 
@@ -29,32 +30,26 @@ def hora_lima(ts: float | None = None) -> str:
 
 
 def texto_alerta(p: Producto, ev: Evaluacion, nombre_tienda: str) -> str:
+    """Mensaje corto: lo importante en la 1.ª línea (%, precio, tienda)."""
     e = html.escape
-    lineas = [f"<b>{ev.titulo}</b>", f"<b>{e(p.nombre[:180])}</b>", ""]
+    emoji = ev.titulo.split()[0]
+    etiqueta = " ¿ERROR?" if emoji == "🚨" else ""
+    pct = f"-{ev.ahorro_pct:.0%} · " if ev.referencia > p.precio else ""
+    lineas = [f"{emoji}<b>{etiqueta} {pct}{soles(p.precio)}</b> · {e(nombre_tienda)}",
+              e(p.nombre[:90])]
     if ev.referencia > p.precio:
-        lineas.append(f"💰 Ahora: <b>{soles(p.precio)}</b>  (antes <s>{soles(ev.referencia)}</s>)")
-        lineas.append(f"📉 <b>-{ev.ahorro_pct:.0%}</b> · ahorras {soles(ev.referencia - p.precio)}")
-    else:
-        lineas.append(f"💰 Ahora: <b>{soles(p.precio)}</b>")
+        lineas.append(f"<s>{soles(ev.referencia)}</s> → ahorras <b>{soles(ev.referencia - p.precio)}</b>")
+    if ev.veredicto:
+        lineas.append(e(ev.veredicto))
+    extras = list(ev.motivos)
     if p.precio_tarjeta:
-        lineas.append(f"💳 Con tarjeta de la tienda: {soles(p.precio_tarjeta)}")
-    tienda = f"🏬 {e(nombre_tienda)}"
-    if p.vendedor:
-        tienda += f" · vendido por {e(p.vendedor[:40])}"
-    lineas.append(tienda)
-    if p.stock is not None:
-        lineas.append(f"📦 Stock: {p.stock} unidades" if p.stock <= 50 else "📦 Stock: disponible")
-    elif p.disponible:
-        lineas.append("📦 Stock: disponible (la tienda no informa unidades)")
-    else:
-        lineas.append("📦 Stock: la tienda no lo informa en el listado")
-    lineas.append("")
-    motivos = [f"• {e(m)}" for m in ev.motivos[:5]]
-    pie = f"🕒 Detectado a las {hora_lima()} (hora de Lima)"
-    # Si no cabe en el pie de foto, se quitan motivos (nunca se corta una etiqueta HTML).
-    while motivos and len("\n".join(lineas + motivos + [pie])) > LIMITE_CAPTION:
-        motivos.pop()
-    return "\n".join(lineas + motivos + [pie])
+        extras.append(f"💳 {soles(p.precio_tarjeta)} con tarjeta")
+    if p.stock is not None and p.stock > config.POCAS_UNIDADES and p.stock <= 50:
+        extras.append(f"📦 {p.stock} unid.")
+    if extras:
+        lineas.append(" · ".join(e(x) for x in extras[:4]))
+    texto = "\n".join(lineas)
+    return texto[:LIMITE_CAPTION]
 
 
 def boton_comprar(url: str) -> dict:
