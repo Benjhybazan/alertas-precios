@@ -449,6 +449,18 @@ def es_prioritaria(p, ev):
             or ev.nivel == analisis.ERROR)
 
 
+def en_descanso(ahora):
+    """¿Estamos en el horario de descanso (hora de Lima)?"""
+    try:
+        inicio, fin = [int(h) * 60 + int(m) for h, m in
+                       (x.split(":") for x in config.DESCANSO.split("-"))]
+    except ValueError:
+        return False
+    local = datetime.fromtimestamp(ahora, LIMA)
+    minuto = local.hour * 60 + local.minute
+    return inicio <= minuto or minuto < fin if inicio > fin else inicio <= minuto < fin
+
+
 def marcar_avisado(est, p, ev, ahora):
     est_p = est["productos"][p.clave]
     est_p["a"] = {"t": int(ahora), "p": p.precio, "n": ev.nivel}
@@ -476,7 +488,9 @@ def enviar_alertas(tg, alertas, nombres, est, ahora, limite):
             log("Sin tiempo para más alertas: quedan pendientes para la próxima revisión.")
             return enviadas
         try:
-            tg.enviar_alerta(p, ev, nombres[p.tienda])
+            # De noche suenan solo los posibles errores de precio.
+            silencioso = en_descanso(ahora) and ev.nivel != analisis.ERROR
+            tg.enviar_alerta(p, ev, nombres[p.tienda], silencioso=silencioso)
             marcar_avisado(est, p, ev, ahora)
             enviadas += 1
         except ErrorTelegram as e:
@@ -496,7 +510,7 @@ def enviar_alertas(tg, alertas, nombres, est, ahora, limite):
     if time.monotonic() > limite:
         return enviadas
     try:
-        tg.enviar_lista(encabezado, lineas)
+        tg.enviar_lista(encabezado, lineas, silencioso=True)  # la lista nunca suena
     except ErrorTelegram as e:
         log(f"No se pudo enviar el resumen: {e}")
         return enviadas

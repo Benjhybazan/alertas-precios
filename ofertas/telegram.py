@@ -93,21 +93,27 @@ class Telegram:
             time.sleep(espera)
         self._ultimo_envio = time.monotonic()
 
-    def enviar_alerta(self, p: Producto, ev: Evaluacion, nombre_tienda: str):
+    def enviar_alerta(self, p: Producto, ev: Evaluacion, nombre_tienda: str,
+                      silencioso: bool = False):
         texto = texto_alerta(p, ev, nombre_tienda)
         botones = boton_comprar(p.url)
         self._pausa()
         if p.imagen:
             try:
                 return self.llamar("sendPhoto", chat_id=self.chat_id, photo=p.imagen,
-                                   caption=texto, parse_mode="HTML", reply_markup=botones)
+                                   caption=texto, parse_mode="HTML", reply_markup=botones,
+                                   disable_notification=silencioso)
             except ErrorTelegram:
                 pass  # p. ej. formato de imagen no aceptado: se envía como texto
-        return self.enviar_texto(texto, botones=botones, vista_previa=p.imagen or p.url)
+        return self.enviar_texto(texto, botones=botones, vista_previa=p.imagen or p.url,
+                                 silencioso=silencioso)
 
-    def enviar_texto(self, texto: str, botones: dict | None = None, vista_previa: str | None = None):
+    def enviar_texto(self, texto: str, botones: dict | None = None, vista_previa: str | None = None,
+                     silencioso: bool = False):
+        """silencioso=True: llega al chat sin sonido ni vibración."""
         self._pausa()
-        datos = {"chat_id": self.chat_id, "text": texto[:LIMITE_MENSAJE], "parse_mode": "HTML"}
+        datos = {"chat_id": self.chat_id, "text": texto[:LIMITE_MENSAJE], "parse_mode": "HTML",
+                 "disable_notification": silencioso}
         if botones:
             datos["reply_markup"] = botones
         if vista_previa:
@@ -117,16 +123,16 @@ class Telegram:
             datos["link_preview_options"] = {"is_disabled": True}
         return self.llamar("sendMessage", **datos)
 
-    def enviar_lista(self, encabezado: str, lineas: list[str]):
+    def enviar_lista(self, encabezado: str, lineas: list[str], silencioso: bool = False):
         """Envía una lista larga partida en mensajes de menos de 4096 caracteres."""
         bloque = encabezado
         for linea in lineas:
             if len(bloque) + len(linea) + 1 > LIMITE_MENSAJE - 50:
-                self.enviar_texto(bloque)
+                self.enviar_texto(bloque, silencioso=silencioso)
                 bloque = ""
             bloque += "\n" + linea
         if bloque.strip():
-            self.enviar_texto(bloque)
+            self.enviar_texto(bloque, silencioso=silencioso)
 
     def actualizaciones(self, offset: int) -> list[dict]:
         return self.llamar("getUpdates", offset=offset, timeout=0,

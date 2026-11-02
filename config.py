@@ -77,6 +77,9 @@ BAJADA_PARA_REAVISAR = _num("BAJADA_PARA_REAVISAR", 0.05)
 MAX_ALERTAS_POR_EJECUCION = _num("MAX_ALERTAS_POR_EJECUCION", 10)
 # Descuento a partir del cual una oferta llega sola (con foto), sea o no de tus intereses.
 DESCUENTO_PRIORITARIO = _num("DESCUENTO_PRIORITARIO", 0.88)
+# Horario de descanso (hora de Lima, "HH:MM-HH:MM"): las alertas llegan sin sonido,
+# salvo los posibles errores de precio. Vacío = sin descanso.
+DESCANSO = os.environ.get("DESCANSO", "").strip() or _UMBRALES.get("DESCANSO") or "23:30-07:00"
 # Resumen diario "el bot sigue vivo" (hora de Lima, 0-23). -1 lo desactiva.
 HORA_RESUMEN_DIARIO = _num("HORA_RESUMEN_DIARIO", 9)
 
