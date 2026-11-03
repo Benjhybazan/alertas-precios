@@ -125,7 +125,7 @@ jobs:
           CONFIGURACION: ${{ secrets.CONFIGURACION }}
           REPO_PRIVADO: ${{ steps.repo.outputs.privado }}
           # Tras revisar, sigue atendiendo comandos hasta estos segundos.
-          ESCUCHAR_SEGUNDOS: "200"
+          ESCUCHAR_SEGUNDOS: "170"
         run: python bot.py
 
       - name: Guardar estado
