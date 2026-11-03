@@ -32,7 +32,7 @@ def hora_lima(ts: float | None = None) -> str:
 def texto_alerta(p: Producto, ev: Evaluacion, nombre_tienda: str) -> str:
     """Mensaje corto: lo importante en la 1.ª línea (%, precio, tienda)."""
     e = html.escape
-    emoji = ev.titulo.split()[0]
+    emoji = "👁" if ev.vigilado else ev.titulo.split()[0]
     etiqueta = " ¿ERROR?" if emoji == "🚨" else ""
     pct = f"-{ev.ahorro_pct:.0%} · " if ev.referencia > p.precio else ""
     lineas = [f"{emoji}<b>{etiqueta} {pct}{soles(p.precio)}</b> · {e(nombre_tienda)}",
@@ -41,7 +41,7 @@ def texto_alerta(p: Producto, ev: Evaluacion, nombre_tienda: str) -> str:
         lineas.append(f"<s>{soles(ev.referencia)}</s> → ahorras <b>{soles(ev.referencia - p.precio)}</b>")
     if ev.veredicto:
         lineas.append(e(ev.veredicto))
-    extras = list(ev.motivos)
+    extras = ([f"Vigilando: {ev.vigilado}"] if ev.vigilado else []) + list(ev.motivos)
     if p.precio_tarjeta:
         extras.append(f"💳 {soles(p.precio_tarjeta)} con tarjeta")
     if p.stock is not None and p.stock > config.POCAS_UNIDADES and p.stock <= 50:
@@ -66,10 +66,12 @@ class Telegram:
     def cerrar(self):
         self._cliente.close()
 
-    def llamar(self, metodo: str, **datos):
+    def llamar(self, metodo: str, _espera: float = 0, **datos):
+        """_espera: segundos extra que Telegram puede tardar (long polling)."""
         for intento in (1, 2, 3):
             try:
-                r = self._cliente.post(self._url + metodo, json=datos)
+                r = self._cliente.post(self._url + metodo, json=datos,
+                                       timeout=20 + _espera)
                 cuerpo = r.json()
             except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
                 if intento == 3:
@@ -134,6 +136,8 @@ class Telegram:
         if bloque.strip():
             self.enviar_texto(bloque, silencioso=silencioso)
 
-    def actualizaciones(self, offset: int) -> list[dict]:
-        return self.llamar("getUpdates", offset=offset, timeout=0,
-                           allowed_updates=["message"]) or []
+    def actualizaciones(self, offset: int, espera: int = 0) -> list[dict]:
+        """espera > 0: Telegram retiene la respuesta hasta que llegue un mensaje
+        (o pasen esos segundos), así los comandos se responden al instante."""
+        return self.llamar("getUpdates", _espera=espera, offset=offset, timeout=espera,
+                           allowed_updates=["message", "callback_query"]) or []

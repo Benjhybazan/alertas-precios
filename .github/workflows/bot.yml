@@ -1,10 +1,10 @@
 name: Bot de ofertas
 
 # Cómo se repite cada ~5 minutos:
-#  * Cadena: cada revisión, al terminar, lanza la siguiente ("encadenado"), que
-#    espera 4 minutos en el entorno "espera" (temporizador de GitHub que no ocupa
-#    servidores) antes de revisar. Así no depende del cron de GitHub, que desde
-#    agosto de 2026 a veces no dispara o llega con horas de retraso.
+#  * Cadena: cada ejecución revisa las tiendas y luego sigue ~3 minutos
+#    escuchando comandos de Telegram (responde en segundos); al terminar lanza
+#    la siguiente. Así no depende del cron de GitHub, que desde agosto de 2026
+#    a veces no dispara o llega con horas de retraso.
 #  * Cron: respaldo; si la cadena se corta, la reinicia cuando GitHub lo lance.
 #    Si la nube lleva >20 min parada, la tarea local de la PC avisa por Telegram.
 on:
@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       encadenado:
-        description: "Esperar 4 minutos antes de revisar (lo usa la cadena automática)"
+        description: "Lanzada por la cadena automática"
         type: boolean
         default: false
 
@@ -30,27 +30,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  esperar:
-    # Solo en la cadena: el entorno "espera" tiene un temporizador de 4 minutos.
-    if: github.event_name == 'workflow_dispatch' && inputs.encadenado
-    environment: espera
-    runs-on: ubuntu-24.04
-    timeout-minutes: 2
-    steps:
-      - run: echo "Espera terminada"
-
   revisar:
-    needs: esperar
-    # Corre tras la espera, o directamente si no venía de la cadena.
-    if: always() && needs.esperar.result != 'failure' && needs.esperar.result != 'cancelled'
     # Versión fija: "ubuntu-latest" cambia de sistema sin aviso y podría romper el bot.
     runs-on: ubuntu-24.04
-    timeout-minutes: 6
+    timeout-minutes: 8
     env:
       # Clave para cifrar el historial: el Secret CLAVE_ESTADO si existe; si no,
       # el token del bot (si cambias el token, el historial empieza de cero).
       CLAVE_ESTADO: ${{ secrets.CLAVE_ESTADO || secrets.TELEGRAM_TOKEN }}
     steps:
+      - name: Anotar la hora de inicio
+        run: echo "INICIO_JOB=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Comprobar configuración
         id: secretos
         env:
@@ -133,6 +124,8 @@ jobs:
           # Configuración privada (tiendas, direcciones, categorías, umbrales).
           CONFIGURACION: ${{ secrets.CONFIGURACION }}
           REPO_PRIVADO: ${{ steps.repo.outputs.privado }}
+          # Tras revisar, sigue atendiendo comandos hasta estos segundos.
+          ESCUCHAR_SEGUNDOS: "200"
         run: python bot.py
 
       - name: Guardar estado
@@ -167,6 +160,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Freno de seguridad: si esta ejecución terminó muy rápido (p. ej. por
+          # un error), espera antes de lanzar la siguiente para no girar en vacío.
+          transcurrido=$(( $(date +%s) - INICIO_JOB ))
+          if [ "$transcurrido" -lt 180 ]; then sleep $(( 180 - transcurrido )); fi
           for intento in 1 2 3; do
             gh workflow run bot.yml --repo "${GITHUB_REPOSITORY}" --ref main -f encadenado=true && exit 0
             sleep 10

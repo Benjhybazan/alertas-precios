@@ -75,6 +75,9 @@ DIAS_DESCUENTO_PERMANENTE = _num("DIAS_DESCUENTO_PERMANENTE", 3)
 BAJADA_PARA_REAVISAR = _num("BAJADA_PARA_REAVISAR", 0.05)
 # Alertas con foto por ejecución; el resto va en un mensaje resumen.
 MAX_ALERTAS_POR_EJECUCION = _num("MAX_ALERTAS_POR_EJECUCION", 10)
+# Desde este descuento se avisa aunque el precio sea menor que MIN_PRECIO_REFERENCIA
+# o el ahorro menor que MIN_AHORRO (productos baratos con descuentos enormes).
+DESCUENTO_SIN_MINIMO = _num("DESCUENTO_SIN_MINIMO", 0.90)
 # Descuento a partir del cual una oferta llega sola (con foto), sea o no de tus intereses.
 DESCUENTO_PRIORITARIO = _num("DESCUENTO_PRIORITARIO", 0.88)
 # Horario de descanso (hora de Lima, "HH:MM-HH:MM"): las alertas llegan sin sonido,

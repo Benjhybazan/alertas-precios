@@ -33,6 +33,7 @@ class Evaluacion:
     motivos: list[str] = field(default_factory=list)
     minimo: float | None = None   # precio más bajo visto en los 30 días previos
     veredicto: str = ""           # una línea: ¿es de verdad el mejor precio?
+    vigilado: str = ""            # búsqueda de /vigilar que la originó (si la hay)
 
     @property
     def ahorro_pct(self) -> float:
@@ -117,7 +118,9 @@ def evaluar(p: Producto, h: list | None, ahora: float) -> Evaluacion | None:
     referencia = max(p.precio_antes or 0, habitual or 0)
     bajo_piso = bool(p.piso and p.precio < p.piso)
 
-    if not bajo_piso:
+    # Con descuentos enormes no importa el precio: se avisa aunque sea barato.
+    enorme = max(descuento, caida) >= config.DESCUENTO_SIN_MINIMO
+    if not bajo_piso and not enorme:
         if referencia < config.MIN_PRECIO_REFERENCIA:
             return None
         if referencia - p.precio < config.MIN_AHORRO:

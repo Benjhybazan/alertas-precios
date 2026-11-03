@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 import httpx
 
 import config
-from ofertas import analisis, estado
+from ofertas import analisis, comandos, estado
 from ofertas.red import SIN_VENTANA, Descargador, ErrorDescarga
 from ofertas.telegram import LIMA, ErrorTelegram, Telegram, hora_lima, soles, texto_alerta
 from ofertas.tiendas import crear_tiendas
@@ -48,6 +48,9 @@ PRESUPUESTO_SEGUNDOS = 4 * 60
 SEGUNDOS_PREPARACION = 15
 # Las mejores alertas se envían siempre, aunque se haya acabado el tiempo.
 ALERTAS_GARANTIZADAS = 3
+# En la nube, tras revisar, el bot sigue escuchando comandos hasta estos segundos
+# desde el inicio (lo fija el flujo de GitHub); 0 = solo mientras revisa.
+ESCUCHAR_SEGUNDOS = int(os.environ.get("ESCUCHAR_SEGUNDOS") or 0)
 
 
 # Repositorio público: los registros de GitHub los puede ver cualquiera, así que
@@ -199,6 +202,10 @@ def ejecutar(args):
     en_pausa = [t for t in tiendas if est["salud"].get(t.clave, {}).get("pausa_hasta", 0) > ahora]
     activas = [t for t in tiendas if t not in en_pausa]
     tiendas_ok = 0
+    escucha = None
+    if tg and not args.local:  # los comandos los atiende la nube
+        escucha = comandos.Escucha(Telegram(token, chat_id), est, nombres, texto_estado)
+        escucha.start()
     try:
         resultados = descargar(activas, est, limite_descarga)
         log(f"Descarga terminada en {time.monotonic() - inicio:.0f} s")
@@ -209,22 +216,31 @@ def ejecutar(args):
             + (f" · {con_errores} con errores (detalle: /estado en Telegram)"
                if con_errores and DISCRETO else "")
             + (f" · {len(en_pausa)} en pausa por bloqueo" if en_pausa else ""))
-        alertas = elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes=guardar)
+        evaluaciones = {}
+        alertas = elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes=guardar,
+                                 evaluaciones=evaluaciones)
+        alertas += alertas_vigiladas(productos, evaluaciones, est, {p.clave for p, _ in alertas})
+        if escucha:
+            escucha.publicar_revision(productos, evaluaciones)
         log(f"{len(productos)} productos analizados, {len(alertas)} alertas nuevas")
 
         enviadas = enviar_alertas(tg, alertas, nombres, est, ahora, limite=limite_total)
         tiendas_ok = actualizar_salud(tg, est, resultados, nombres, ahora)
         est["ejecuciones"].append([int(ahora), len(productos), enviadas, tiendas_ok, len(tiendas)])
-        if tg and not args.local:  # comandos y resumen los atiende la nube
+        if tg and not args.local:  # el resumen lo envía la nube
             try:
                 resumen_diario(tg, est, nombres, ahora)
-                atender_comandos(tg, est, nombres, ahora)
             except ErrorTelegram as e:
                 log(f"Telegram: {e}")
+            escucha.terminar(inicio + ESCUCHAR_SEGUNDOS)
         if privado:
             controlar_minutos(tg, est, ahora, time.monotonic() - inicio)
     finally:
         # Pase lo que pase, el historial y las alertas ya enviadas se guardan.
+        if escucha and escucha.is_alive():
+            escucha.terminar()
+        if escucha:
+            escucha.tg.cerrar()
         if tg:
             tg.cerrar()
         if guardar:
@@ -342,7 +358,7 @@ def vincular_dueno(token, est):
                 est["dueno_chat"] = str(chat["id"])
                 tg.chat_id = est["dueno_chat"]
                 tg.enviar_texto("✅ ¡Listo! Este chat quedó vinculado: aquí recibirás las alertas "
-                                "de ofertas.\n\n/estado — ver si el bot y las tiendas funcionan")
+                                "de ofertas.\n\n/menu — botones de acceso rápido · /ayuda — comandos")
                 log("Chat de Telegram vinculado.")
                 return est["dueno_chat"]
     except ErrorTelegram as e:
@@ -397,12 +413,15 @@ def unificar(resultados, est, nombres, ahora):
     return productos, linea_base
 
 
-def elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes):
-    """Evalúa cada producto, registra su historial y devuelve las alertas a enviar."""
+def elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes, evaluaciones=None):
+    """Evalúa cada producto, registra su historial y devuelve las alertas a enviar.
+    En `evaluaciones` deja las ofertas válidas (las usan /top y /buscar)."""
     candidatas = []
     for clave, p in productos.items():
         est_p = est["productos"].get(clave)
         ev = analisis.evaluar(p, (est_p or {}).get("h"), ahora)
+        if ev is not None and evaluaciones is not None:
+            evaluaciones[clave] = ev
         if ev and analisis.es_novedad(p, ev, est_p, linea_base[clave]):
             candidatas.append((p, ev))
         analisis.registrar(est["productos"].setdefault(clave, {}), p, ahora)
@@ -426,6 +445,39 @@ def elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes):
     return alertas
 
 
+def alertas_vigiladas(productos, evaluaciones, est, ya_incluidas):
+    """Productos que coinciden con /vigilar: precio máximo pedido o, si no se dio,
+    un descuento de al menos comandos.DESCUENTO_VIGILADO. Se avisa una vez por
+    producto (otra vez solo si baja un 5 % más)."""
+    alertas = []
+    for v in list(est.get("vigilar") or []):
+        buscadas = comandos.palabras(v["q"])
+        for clave, p in productos.items():
+            if clave in ya_incluidas or p.disponible is False or p.precio <= 0:
+                continue
+            if not comandos.coincide(p.nombre, buscadas):
+                continue
+            pct = comandos.descuento(p)
+            if v.get("max") is not None:
+                if p.precio > v["max"]:
+                    continue
+            elif pct < comandos.DESCUENTO_VIGILADO:
+                continue
+            previo = v.get("avisados", {}).get(clave)
+            if previo and p.precio > previo * (1 - config.BAJADA_PARA_REAVISAR):
+                continue
+            base = evaluaciones.get(clave)
+            ev = analisis.Evaluacion(
+                nivel=base.nivel if base else analisis.GRANDE, descuento=pct,
+                caida=base.caida if base else 0.0, habitual=base.habitual if base else None,
+                referencia=max(p.precio_antes or 0, p.precio), motivos=base.motivos if base else [],
+                minimo=base.minimo if base else None, veredicto=base.veredicto if base else "",
+                vigilado=v["q"])
+            alertas.append((p, ev))
+            ya_incluidas.add(clave)
+    return alertas
+
+
 _RE_INTERES = {}
 
 
@@ -444,8 +496,9 @@ def es_de_interes(p):
 
 
 def es_prioritaria(p, ev):
-    """Llega sola, con foto: tus intereses, descuentos enormes o posibles errores."""
-    return (es_de_interes(p) or ev.ahorro_pct >= config.DESCUENTO_PRIORITARIO
+    """Llega sola, con foto: tus intereses, lo que vigilas, descuentos enormes o
+    posibles errores."""
+    return (bool(ev.vigilado) or es_de_interes(p) or ev.ahorro_pct >= config.DESCUENTO_PRIORITARIO
             or ev.nivel == analisis.ERROR)
 
 
@@ -461,11 +514,27 @@ def en_descanso(ahora):
     return inicio <= minuto or minuto < fin if inicio > fin else inicio <= minuto < fin
 
 
+def silenciado(est, ahora):
+    """¿El usuario pidió /silencio y aún no termina?"""
+    return est.get("silencio_hasta", 0) > ahora
+
+
 def marcar_avisado(est, p, ev, ahora):
-    est_p = est["productos"][p.clave]
+    est_p = est["productos"].setdefault(p.clave, {})
     est_p["a"] = {"t": int(ahora), "p": p.precio, "n": ev.nivel}
     est_p.pop("pend", None)
     est["avisos_recientes"][firma(p)] = [int(ahora), p.clave]
+    if ev.vigilado:
+        for v in est.get("vigilar") or []:
+            if v["q"] == ev.vigilado:
+                avisados = v.setdefault("avisados", {})
+                avisados[p.clave] = p.precio
+                if len(avisados) > 200:
+                    del avisados[next(iter(avisados))]
+    # Para /hoy: las alertas de las últimas 24 h.
+    recientes = est.setdefault("recientes", [])
+    recientes.append([int(ahora), p.nombre[:80], p.precio, round(ev.ahorro_pct, 3), p.url, p.tienda])
+    est["recientes"] = [r for r in recientes if ahora - r[0] < 86400][-150:]
 
 
 def enviar_alertas(tg, alertas, nombres, est, ahora, limite):
@@ -488,8 +557,10 @@ def enviar_alertas(tg, alertas, nombres, est, ahora, limite):
             log("Sin tiempo para más alertas: quedan pendientes para la próxima revisión.")
             return enviadas
         try:
-            # De noche suenan solo los posibles errores de precio.
-            silencioso = en_descanso(ahora) and ev.nivel != analisis.ERROR
+            # De noche suenan solo los posibles errores de precio de productos que
+            # no son baratos; con /silencio no suena nada.
+            alarma = ev.nivel == analisis.ERROR and ev.referencia >= config.MIN_PRECIO_REFERENCIA
+            silencioso = silenciado(est, ahora) or (en_descanso(ahora) and not alarma)
             tg.enviar_alerta(p, ev, nombres[p.tienda], silencioso=silencioso)
             marcar_avisado(est, p, ev, ahora)
             enviadas += 1
@@ -605,7 +676,12 @@ def texto_estado(est, nombres, ahora):
         lineas.append(f"\n⏱️ Minutos de GitHub este mes (estimado): {uso['min']:,} de "
                       f"{config.MINUTOS_GRATIS_MES:,}")
     lineas.append(f"\nUmbrales: descuento ≥ {config.MIN_DESCUENTO:.0%} · referencia ≥ "
-                  f"{soles(config.MIN_PRECIO_REFERENCIA)} · nivel mínimo {config.NIVEL_MINIMO}")
+                  f"{soles(config.MIN_PRECIO_REFERENCIA)} (sin mínimo desde "
+                  f"{config.DESCUENTO_SIN_MINIMO:.0%}) · nivel mínimo {config.NIVEL_MINIMO}")
+    if est.get("vigilar"):
+        lineas.append(f"👁 Vigilando {len(est['vigilar'])} producto(s): /vigilados")
+    if silenciado(est, ahora):
+        lineas.append(f"🔕 Sin sonido hasta las {hora_lima(est['silencio_hasta'])}")
     return "\n".join(lineas)
 
 
@@ -617,22 +693,6 @@ def resumen_diario(tg, est, nombres, ahora):
     if local.hour >= config.HORA_RESUMEN_DIARIO and est.get("resumen_diario") != hoy:
         tg.enviar_texto("☀️ <b>Resumen diario</b>\n" + texto_estado(est, nombres, ahora))
         est["resumen_diario"] = hoy
-
-
-def atender_comandos(tg, est, nombres, ahora):
-    """Responde /estado y /start. Solo al chat configurado; ignora a extraños."""
-    for upd in tg.actualizaciones(est.get("telegram_offset", 0)):
-        est["telegram_offset"] = upd["update_id"] + 1
-        msg = upd.get("message") or {}
-        if str((msg.get("chat") or {}).get("id")) != tg.chat_id:
-            continue
-        comando = (msg.get("text") or "").strip().split("@")[0].lower()
-        if comando in ("/estado", "/status"):
-            tg.enviar_texto(texto_estado(est, nombres, ahora))
-        elif comando in ("/start", "/ayuda", "/help"):
-            tg.enviar_texto("🤖 Bot de ofertas extremas activo.\nTe avisaré cuando detecte "
-                            "posibles errores de precio y descuentos excepcionales.\n\n"
-                            "/estado — ver si el bot y las tiendas funcionan")
 
 
 # ---------------------------------------------------------------------------
