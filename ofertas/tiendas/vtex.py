@@ -48,11 +48,16 @@ class Vtex(Tienda):
             if mejor:
                 ofertas.append((item, *mejor))
         nombre = limpiar(p.get("productName"))
+        # Tiendas que publican "precios de lista" inventados (S/ 10 879 por unos
+        # audífonos de S/ 49): se ignora su precio anterior y solo cuenta el
+        # historial del bot (bajadas reales de precio).
+        confiar_antes = self.cfg.get("confiar_precio_antes", True)
         varios_precios = len({co["Price"] for _, _, co in ofertas}) > 1
         productos = []
         for item, vend, co in ofertas:
             imagenes = item.get("images") or []
-            precio, lista = float(co["Price"]), float(co.get("ListPrice") or 0)
+            precio = float(co["Price"])
+            lista = float(co.get("ListPrice") or 0) if confiar_antes else 0.0
             productos.append(Producto(
                 tienda=self.clave,
                 id=f"{p.get('productId')}-{item.get('itemId')}",
