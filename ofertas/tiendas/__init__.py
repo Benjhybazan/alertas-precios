@@ -14,5 +14,21 @@ TIPOS = {
 
 
 def crear_tiendas(config_tiendas: dict):
-    return [TIPOS[cfg["tipo"]](clave, cfg)
-            for clave, cfg in config_tiendas.items() if cfg.get("activa", True)]
+    """Devuelve (tiendas, invalidas). Una tienda mal configurada (tipo
+    desconocido, expresión inválida...) se omite sin afectar a las demás."""
+    tiendas, invalidas = [], []
+    for clave, cfg in (config_tiendas or {}).items():
+        if not isinstance(cfg, dict):
+            invalidas.append((clave, "su configuración no es un objeto"))
+            continue
+        if not cfg.get("activa", True):
+            continue
+        clase = TIPOS.get(cfg.get("tipo"))
+        if clase is None:
+            invalidas.append((clave, f"tipo desconocido: {cfg.get('tipo')!r}"))
+            continue
+        try:
+            tiendas.append(clase(clave, cfg))
+        except Exception as e:  # p. ej. una expresión regular inválida
+            invalidas.append((clave, f"{e.__class__.__name__}: {e}"))
+    return tiendas, invalidas

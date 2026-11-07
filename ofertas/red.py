@@ -43,6 +43,7 @@ class Descargador:
                 },
                 timeout=config.TIMEOUT_SEGUNDOS,
                 follow_redirects=True,
+                max_redirects=5,
             )
 
     def sin_tiempo(self) -> bool:
@@ -84,7 +85,8 @@ class Descargador:
     def _curl_get(self, url):
         marca = "\n__HTTP_CODE__:"
         proc = subprocess.run(
-            [self._curl, "-sS", "-L", "--compressed",
+            [self._curl, "-sS", "-L", "--compressed", "--proto", "=http,https",
+             "--proto-redir", "=http,https", "--max-redirs", "5", "--max-filesize", "50M",
              "-m", str(config.TIMEOUT_SEGUNDOS),
              "-A", config.USER_AGENT,
              "-H", "Accept-Language: es-PE,es;q=0.9",

@@ -1,6 +1,6 @@
 """Decide qué productos son oportunidades reales y cuáles merecen alerta.
 
-Historial por producto: lista de tramos [inicio, precio, precio_antes]; se
+Historial por producto: lista de tramos [inicio, precio]; se
 añade un tramo solo cuando el precio cambia. Con eso se calcula el "precio
 habitual" (mediana ponderada por tiempo) para confirmar bajadas reales y
 descartar descuentos engañosos (precio anterior inflado o descuento eterno)."""
@@ -21,6 +21,7 @@ DIA = 86400
 VENTANA_HISTORIAL = 30 * DIA
 MIN_OBSERVACION = 3600  # al menos 1 h de historial previo para usarlo
 DIAS_AVISO = 7          # un aviso deja de silenciar al producto tras una semana
+MAX_TRAMOS = 30         # cambios de precio que se recuerdan por producto
 
 
 @dataclass
@@ -97,11 +98,8 @@ def registrar(est: dict, p: Producto, ahora: float):
         del est["a"]
     h = est.setdefault("h", [])
     if not h or not _mismo_precio(h[-1][1], p.precio):
-        h.append([int(ahora), p.precio, p.precio_antes])
-        del h[:-30]
-    else:
-        h[-1][2] = p.precio_antes
-    est["n"] = p.nombre[:120]
+        h.append([int(ahora), p.precio])
+        del h[:-MAX_TRAMOS]
     est["v"] = int(ahora)
 
 

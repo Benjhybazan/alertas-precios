@@ -4,13 +4,15 @@
 Solo atiende al chat del dueño; los demás mensajes se ignoran."""
 
 import html
+import math
 import re
 import threading
 import time
 from datetime import datetime
 
 import config
-
+from ofertas.alertas import DESCUENTO_VIGILADO, coincide, descuento, palabras
+from ofertas.registro import log
 from ofertas.telegram import LIMA, ErrorTelegram, soles
 from ofertas.tiendas.base import slug
 
@@ -50,23 +52,10 @@ BOTONES_MENU = {"inline_keyboard": [
 
 MAX_VIGILADOS = 20
 MAX_RESULTADOS = 10
-# Sin precio máximo, un vigilado avisa desde este descuento.
-DESCUENTO_VIGILADO = 0.40
 ESPERA_REVISION = 90  # segundos máximos esperando la revisión en curso
-
-
-def palabras(texto: str) -> list[str]:
-    return [w for w in slug(texto).split("-") if w]
-
-
-def coincide(nombre: str, buscadas: list[str]) -> bool:
-    """Todas las palabras buscadas aparecen en el nombre (sin tildes ni mayúsculas)."""
-    s = slug(nombre)
-    return bool(buscadas) and all(w in s for w in buscadas)
-
-
-def descuento(p) -> float:
-    return 1 - p.precio / p.precio_antes if p.precio_antes and p.precio_antes > p.precio else 0.0
+PAUSA_TRAS_FALLO = 5  # segundos antes de volver a escuchar si Telegram no responde
+# Texto suelto que se entiende como comando aunque no empiece por "/".
+PALABRAS_COMANDO = ("top", "hoy", "vigilados", "estado", "ayuda", "silencio", "sonido", "olvidar")
 
 
 def linea(p, pct, nombre_tienda, marca=""):
@@ -101,6 +90,7 @@ class Escucha(threading.Thread):
         self._parar = threading.Event()
         self._revision = threading.Event()
         self.productos, self.evaluaciones = {}, {}
+        self._indice = None               # [(producto, nombre en slug)] para /buscar
         self.error = None
 
     # --- control desde la ejecución principal ---
@@ -108,6 +98,7 @@ class Escucha(threading.Thread):
     def publicar_revision(self, productos, evaluaciones):
         """Productos de la revisión en curso: con ellos responden /top y /buscar."""
         self.productos, self.evaluaciones = productos, evaluaciones
+        self._indice = None
         self._revision.set()
 
     def terminar(self, hasta=None):
@@ -121,29 +112,39 @@ class Escucha(threading.Thread):
     # --- bucle ---
 
     def run(self):
-        try:
-            self._registrar_menu()
-            while True:
-                restante = (self.fin - time.monotonic()) if self.fin is not None else 20
-                ultima = restante <= 0 or self._parar.is_set()
-                espera = 0 if ultima else int(max(1, min(20, restante)))
-                nuevas = 0
-                for upd in self.tg.actualizaciones(self.est.get("telegram_offset", 0), espera):
-                    if upd["update_id"] < self.est.get("telegram_offset", 0):
-                        continue
-                    self.est["telegram_offset"] = upd["update_id"] + 1
-                    nuevas += 1
-                    try:
-                        self.atender(upd)
-                    except ErrorTelegram as e:
-                        print(f"Telegram: {e}", flush=True)
-                if ultima:
+        """Escucha hasta `fin`. Un fallo de red no termina la escucha (se reintenta
+        tras una pausa) y un comando que falla no afecta a los siguientes."""
+        self._registrar_menu()
+        while True:
+            restante = (self.fin - time.monotonic()) if self.fin is not None else 20
+            ultima = restante <= 0 or self._parar.is_set()
+            espera = 0 if ultima else int(max(1, min(20, restante)))
+            try:
+                actualizaciones = self.tg.actualizaciones(self.est.get("telegram_offset", 0), espera)
+            except ErrorTelegram as e:
+                self.error = e
+                log(f"Telegram: {e}")
+                if ultima or self._parar.wait(PAUSA_TRAS_FALLO):
                     return
-                if not nuevas:
-                    self._parar.wait(1)  # por si Telegram responde sin esperar
-        except ErrorTelegram as e:
-            self.error = e
-            print(f"Telegram: {e}", flush=True)
+                continue
+            nuevas = 0
+            for upd in actualizaciones:
+                if not isinstance(upd, dict) or not isinstance(upd.get("update_id"), int):
+                    continue
+                if upd["update_id"] < self.est.get("telegram_offset", 0):
+                    continue
+                self.est["telegram_offset"] = upd["update_id"] + 1
+                nuevas += 1
+                try:
+                    self.atender(upd)
+                except ErrorTelegram as e:
+                    log(f"Telegram: {e}")
+                except Exception as e:  # un comando raro no debe apagar la escucha
+                    log(f"Comando no atendido ({e.__class__.__name__})")
+            if ultima:
+                return
+            if not nuevas:
+                self._parar.wait(1)  # por si Telegram responde sin esperar
 
     def _registrar_menu(self):
         if self.est.get("menu_comandos") == VERSION_MENU:
@@ -180,8 +181,7 @@ class Escucha(threading.Thread):
             comando = comando.split("@")[0].lower()
         else:
             comando, resto = texto.split(" ", 1)[0].lower(), ""
-            if comando not in ("top", "hoy", "vigilados", "estado", "ayuda", "silencio",
-                               "sonido", "olvidar"):
+            if comando not in PALABRAS_COMANDO:
                 comando, resto = "buscar", texto  # texto suelto = búsqueda
             else:
                 resto = texto.partition(" ")[2]
@@ -244,6 +244,12 @@ class Escucha(threading.Thread):
             f"🔥 <b>Lo más rebajado ahora</b> ({len(productos):,} productos revisados)\n"
             "✅ = el bot confirma que es una oferta real", lineas)
 
+    def _buscables(self):
+        """Nombres de la revisión pasados por slug una sola vez (búsquedas rápidas)."""
+        if self._indice is None:
+            self._indice = [(p, slug(p.nombre)) for p in self.productos.values()]
+        return self._indice
+
     def _ahorro(self, p):
         ev = self.evaluaciones.get(p.clave)
         return ev.ahorro_pct if ev else 0.0
@@ -254,7 +260,7 @@ class Escucha(threading.Thread):
             self.tg.enviar_texto("Escribe qué buscar, por ejemplo: <code>/buscar airpods</code>")
             return
         productos = self._esperar_revision()
-        hallados = sorted((p for p in productos.values() if coincide(p.nombre, buscadas)),
+        hallados = sorted((p for p, nombre in self._buscables() if coincide(nombre, buscadas)),
                           key=lambda p: -max(descuento(p), self._ahorro(p)))
         consulta = html.escape(texto[:60])
         if not hallados:
@@ -295,6 +301,11 @@ class Escucha(threading.Thread):
                                  f"{DESCUENTO_VIGILADO:.0%} de descuento)")
             return
         lista = self.est.setdefault("vigilar", [])
+        repetido = next((v for v in lista if palabras(v["q"]) == palabras(consulta)), None)
+        if repetido:  # misma búsqueda (o comando repetido): se actualiza, no se duplica
+            repetido["max"] = maximo
+            self.tg.enviar_texto(f"👁 Ya vigilaba «{html.escape(repetido['q'])}»: lo actualicé.")
+            return
         if len(lista) >= MAX_VIGILADOS:
             self.tg.enviar_texto(f"Ya vigilo {MAX_VIGILADOS} productos. Quita alguno con /vigilados.")
             return
@@ -336,6 +347,8 @@ class Escucha(threading.Thread):
         try:
             horas = float((texto.split() or ["2"])[0].replace(",", "."))
         except ValueError:
+            horas = 2
+        if not math.isfinite(horas):
             horas = 2
         horas = min(max(horas, 0.25), 72)
         hasta = time.time() + horas * 3600

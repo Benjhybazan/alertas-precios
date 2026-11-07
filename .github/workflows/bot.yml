@@ -1,9 +1,9 @@
 name: Bot de ofertas
 
-# Cómo se repite cada ~5 minutos:
-#  * Cadena: cada ejecución revisa las tiendas y luego sigue ~3 minutos
-#    escuchando comandos de Telegram (responde en segundos); al terminar lanza
-#    la siguiente. Así no depende del cron de GitHub, que desde agosto de 2026
+# Cómo se repite cada ~3-5 minutos:
+#  * Cadena: cada ejecución revisa las tiendas y luego sigue escuchando
+#    comandos de Telegram (responde en segundos); al terminar lanza la
+#    siguiente. Así no depende del cron de GitHub, que desde agosto de 2026
 #    a veces no dispara o llega con horas de retraso.
 #  * Cron: respaldo; si la cadena se corta, la reinicia cuando GitHub lo lance.
 #    Si la nube lleva >20 min parada, la tarea local de la PC avisa por Telegram.
@@ -34,10 +34,10 @@ jobs:
     # Versión fija: "ubuntu-latest" cambia de sistema sin aviso y podría romper el bot.
     runs-on: ubuntu-24.04
     timeout-minutes: 8
-    env:
-      # Clave para cifrar el historial: el Secret CLAVE_ESTADO si existe; si no,
-      # el token del bot (si cambias el token, el historial empieza de cero).
-      CLAVE_ESTADO: ${{ secrets.CLAVE_ESTADO || secrets.TELEGRAM_TOKEN }}
+    # Los Secrets se entregan solo a los pasos que los necesitan, nunca a las
+    # acciones de terceros. La clave del historial es el Secret CLAVE_ESTADO si
+    # existe; si no, el token del bot (si cambias el token, el historial
+    # empieza de cero y el anterior queda en respaldo.enc).
     steps:
       - name: Anotar la hora de inicio
         run: echo "INICIO_JOB=$(date +%s)" >> "$GITHUB_ENV"
@@ -57,8 +57,11 @@ jobs:
             echo "::notice::Faltan los Secrets CONFIGURACION y/o TELEGRAM_TOKEN: el bot espera sin revisar tiendas."
           fi
 
-      - uses: actions/checkout@v7
+      # Acciones fijadas por su huella exacta (una etiqueta se puede mover).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         if: steps.secretos.outputs.listo == 'true'
+        with:
+          persist-credentials: false  # el código del bot no ve credenciales de git
 
       - name: Detectar si el repositorio es privado
         id: repo
@@ -66,13 +69,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         # En privado el bot limita cada ejecución a menos de 1 minuto; en
-        # público oculta los detalles en los registros. Si falla, asume privado.
+        # público oculta los detalles en los registros. Si no se puede saber,
+        # "desconocido": el bot oculta los detalles igual (ante la duda, privacidad).
         run: |
-          privado=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .private 2>/dev/null || echo true)
+          privado=desconocido
+          for intento in 1 2 3; do
+            r=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .private 2>/dev/null) && { privado=$r; break; }
+            sleep 3
+          done
           echo "privado=${privado}" >> "$GITHUB_OUTPUT"
           echo "Repositorio privado: ${privado}"
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         if: steps.secretos.outputs.listo == 'true'
         with:
           python-version: "3.12"
@@ -80,19 +88,25 @@ jobs:
 
       - name: Instalar dependencias
         if: steps.secretos.outputs.listo == 'true'
-        run: pip install -r requirements.txt
+        # Versiones fijas con hash: un paquete alterado hace fallar la instalación.
+        run: |
+          pip install --require-hashes --only-binary :all: -r requirements.txt
 
       - name: Recuperar estado
         id: recuperar
         if: steps.secretos.outputs.listo == 'true'
+        env:
+          CLAVE_ESTADO: ${{ secrets.CLAVE_ESTADO || secrets.TELEGRAM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "$CLAVE_ESTADO" ]; then
             echo "::error::Falta el Secret CLAVE_ESTADO (sirve para cifrar el historial)."
             exit 1
           fi
           mkdir -p datos
+          remoto="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           set +e
-          git ls-remote --exit-code --heads origin estado > /dev/null
+          git ls-remote --exit-code --heads "$remoto" estado > /dev/null
           existe=$?
           set -e
           if [ "$existe" = "2" ]; then
@@ -102,19 +116,28 @@ jobs:
           # La rama existe (o no se pudo consultar): hay que recuperarla sí o sí.
           # Si falla, el paso falla y NO se sobrescribe el historial.
           for intento in 1 2 3; do
-            git fetch --depth=1 origin estado && break
+            git fetch -q --depth=1 "$remoto" estado && break
             [ "$intento" = "3" ] && exit 1
             sleep 5
           done
           git show FETCH_HEAD:estado.enc > datos/estado.enc
+          # Respaldo de un historial que no se pudo descifrar: se conserva.
+          git show FETCH_HEAD:respaldo.enc > datos/respaldo.enc 2>/dev/null || rm -f datos/respaldo.enc
+          # gzip -t: con una clave equivocada openssl a veces "acierta" por azar
+          # y produce basura; solo cuenta como recuperado si es un archivo válido.
           if openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:CLAVE_ESTADO \
-               -in datos/estado.enc -out datos/estado.json.gz 2>/dev/null; then
+               -in datos/estado.enc -out datos/estado.json.gz 2>/dev/null \
+             && gzip -t datos/estado.json.gz 2>/dev/null; then
             echo "Estado recuperado"
+            rm -f datos/estado.enc
           else
-            echo "::warning::No se pudo descifrar el historial (¿cambió CLAVE_ESTADO?). Se empieza de cero."
+            # Clave cambiada o Secret mal copiado: se empieza de cero, pero el
+            # historial anterior se guarda tal cual (respaldo.enc) por si se
+            # recupera la clave correcta.
+            echo "::warning::No se pudo descifrar el historial (¿cambió CLAVE_ESTADO?). Se empieza de cero; el anterior queda en respaldo.enc."
             rm -f datos/estado.json.gz
+            mv datos/estado.enc datos/respaldo.enc
           fi
-          rm -f datos/estado.enc
 
       - name: Revisar tiendas y enviar alertas
         if: steps.secretos.outputs.listo == 'true'
@@ -124,8 +147,9 @@ jobs:
           # Configuración privada (tiendas, direcciones, categorías, umbrales).
           CONFIGURACION: ${{ secrets.CONFIGURACION }}
           REPO_PRIVADO: ${{ steps.repo.outputs.privado }}
-          # Tras revisar, sigue atendiendo comandos hasta estos segundos.
-          ESCUCHAR_SEGUNDOS: "170"
+          # Tras revisar, sigue atendiendo comandos hasta estos segundos (en un
+          # repositorio privado no: cada minuto cuenta para el límite gratis).
+          ESCUCHAR_SEGUNDOS: ${{ steps.repo.outputs.privado == 'true' && '0' || '170' }}
         run: python bot.py
 
       - name: Guardar estado
@@ -133,6 +157,7 @@ jobs:
         # historial con uno vacío) y el bot llegó a escribir el archivo.
         if: always() && steps.recuperar.outcome == 'success' && hashFiles('datos/estado.json.gz') != ''
         env:
+          CLAVE_ESTADO: ${{ secrets.CLAVE_ESTADO || secrets.TELEGRAM_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
           # El historial se cifra: aunque la rama sea pública, nadie puede leerlo.
@@ -141,11 +166,12 @@ jobs:
           mkdir -p salida
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:CLAVE_ESTADO \
             -in datos/estado.json.gz -out salida/estado.enc
+          if [ -f datos/respaldo.enc ]; then cp datos/respaldo.enc salida/respaldo.enc; fi
           cd salida
           git init -q -b estado
           git config user.name "bot-ofertas"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add estado.enc
+          git add -A
           git commit -qm "Estado $(date -u +%Y-%m-%dT%H:%MZ)"
           for intento in 1 2 3; do
             git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" estado && exit 0
@@ -155,7 +181,8 @@ jobs:
 
       - name: Programar la siguiente revisión
         # Siempre que el bot esté configurado, aunque esta revisión haya fallado.
-        if: always() && steps.secretos.outputs.listo == 'true'
+        # En un repositorio privado no hay cadena (agotaría los minutos gratis).
+        if: always() && steps.secretos.outputs.listo == 'true' && steps.repo.outputs.privado != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -174,7 +201,7 @@ jobs:
         # GitHub desactiva los cron de repositorios públicos sin actividad en
         # 60 días; volver a habilitar el flujo por la API lo evita. En
         # repositorios privados no hace falta.
-        if: github.event_name == 'schedule' && steps.repo.outputs.privado != 'true'
+        if: always() && github.event_name == 'schedule' && steps.repo.outputs.privado != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}

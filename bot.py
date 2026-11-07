@@ -4,191 +4,111 @@ Cada ejecución revisa las tiendas una vez, envía las alertas nuevas y guarda
 el estado. En la nube lo ejecuta GitHub Actions cada pocos minutos.
 
 Uso:
-  python bot.py                    revisión normal (necesita TELEGRAM_TOKEN y TELEGRAM_CHAT_ID)
+  python bot.py                    revisión normal (necesita TELEGRAM_TOKEN)
   python bot.py --sin-telegram     prueba: muestra las alertas en pantalla, sin enviar ni guardar
   python bot.py --chat-id          muestra el chat id de quien escribió al bot
   python bot.py --probar-telegram  envía un mensaje de prueba con botón
   python bot.py --solo CLAVE       revisa solo una tienda (su clave en la configuración)
   python bot.py --local            revisa en esta PC las tiendas marcadas "solo_local"
                                    (lo usa la tarea programada de Windows)
+
+Módulos (carpeta ofertas/): descarga (tiendas en paralelo), analisis (qué es
+oferta real), alertas (qué avisar y cómo), comandos (Telegram interactivo),
+informes (salud y /estado), local (modo PC), estado (historial persistente).
 """
 
 import argparse
-import html
-import math
 import os
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-
-import httpx
+import traceback
 
 import config
-from ofertas import analisis, comandos, estado
-from ofertas.red import SIN_VENTANA, Descargador, ErrorDescarga
-from ofertas.telegram import LIMA, ErrorTelegram, Telegram, hora_lima, soles, texto_alerta
+from ofertas import comandos, estado, local, registro
+from ofertas.alertas import alertas_vigiladas, elegir_alertas, enviar_alertas
+from ofertas.descarga import descargar, unificar
+from ofertas.informes import actualizar_salud, controlar_minutos, resumen_diario, texto_estado
+from ofertas.registro import log
+from ofertas.telegram import ErrorTelegram, Telegram
 from ofertas.tiendas import crear_tiendas
-from ofertas.tiendas.base import slug
 
 RUTA_ESTADO = os.environ.get("RUTA_ESTADO", os.path.join("datos", "estado.json.gz"))
-DIR_BOT = os.path.dirname(os.path.abspath(__file__))
-# Modo --local: el token se lee de este archivo (excluido de git).
-ARCHIVO_TOKEN_LOCAL = os.path.join(DIR_BOT, "telegram_token.txt")
 
 # Repositorio público: tiempo máximo para enviar alertas; lo que no alcance
 # queda pendiente para la siguiente ejecución (GitHub corta el trabajo a los 6 min).
 PRESUPUESTO_SEGUNDOS = 4 * 60
-# Segundos que GitHub tarda en preparar y cerrar cada ejecución (fuera del bot).
-SEGUNDOS_PREPARACION = 15
-# Las mejores alertas se envían siempre, aunque se haya acabado el tiempo.
-ALERTAS_GARANTIZADAS = 3
+
+
+def _entero(nombre, defecto=0):
+    try:
+        return int(os.environ.get(nombre) or defecto)
+    except ValueError:
+        return defecto
+
+
 # En la nube, tras revisar, el bot sigue escuchando comandos hasta estos segundos
 # desde el inicio (lo fija el flujo de GitHub); 0 = solo mientras revisa.
-ESCUCHAR_SEGUNDOS = int(os.environ.get("ESCUCHAR_SEGUNDOS") or 0)
+ESCUCHAR_SEGUNDOS = _entero("ESCUCHAR_SEGUNDOS")
 
 
-# Repositorio público: los registros de GitHub los puede ver cualquiera, así que
-# solo muestran totales (sin tiendas, categorías ni errores detallados). Los
-# detalles se consultan en Telegram con /estado.
-DISCRETO = False
+def _repo_privado():
+    """True / False según GitHub; None si no se sabe (o fuera de GitHub)."""
+    valor = os.environ.get("REPO_PRIVADO", "").strip().lower()
+    return {"true": True, "false": False}.get(valor)
 
 
-def log(msg, detalle=False):
-    if detalle and DISCRETO:
-        return
-    print(f"[{hora_lima()}] {msg}", flush=True)
-
-
-def sin_html(texto):
-    """Versión para consola de un mensaje con formato HTML de Telegram."""
-    return html.unescape(re.sub(r"<[^>]+>", "", texto))
-
-
-def firma(p):
-    """Mismo artículo al mismo precio, aunque lo publiquen varias tiendas."""
-    return f"{slug(p.nombre)[:60]}|{round(p.precio)}"
-
-
-# ---------------------------------------------------------------------------
-# Descarga
-# ---------------------------------------------------------------------------
-
-def revisar_tienda(tienda, cursor, inicio, limite):
-    """Lee las fuentes de una tienda empezando por la posición `inicio`.
-
-    Si hay límite de tiempo (repositorio privado) y no alcanza, la siguiente
-    ejecución continúa por las fuentes que quedaron sin leer."""
-    fuentes, nuevo_cursor = tienda.fuentes(cursor)
-    k = inicio % len(fuentes) if fuentes else 0
-    cola, tomadas, candado = iter(fuentes[k:] + fuentes[:k]), [], threading.Lock()
-
-    def siguiente():
-        with candado:
-            if limite and time.monotonic() > limite:
-                return None
-            f = next(cola, None)
-            if f:
-                tomadas.append(f)
-            return f
-
-    n = max(1, min(tienda.conexiones, len(fuentes)))
-    with ThreadPoolExecutor(max_workers=n) as pool:
-        partes = list(pool.map(lambda _: leer_fuentes(tienda, siguiente, limite), range(n)))
-    return {
-        "lecturas": [x for lec, _ in partes for x in lec],
-        "errores": [x for _, err in partes for x in err],
-        "cursor": nuevo_cursor,
-        "inicio": (k + len(tomadas)) % len(fuentes) if fuentes else 0,
-        "sin_leer": len(fuentes) - len(tomadas),
-    }
-
-
-def leer_fuentes(tienda, siguiente, limite=None):
-    """Una conexión: toma fuentes de la cola compartida hasta que se acaben."""
-    lecturas, errores = [], []
-    try:
-        d = Descargador(usar_curl=tienda.usar_curl, limite=limite)
-    except ErrorDescarga as e:
-        return [], [str(e)]
-    try:
-        while (f := siguiente()) is not None:
-            try:
-                lecturas.append((f, tienda.leer(f, d)))
-            except ErrorDescarga as e:
-                errores.append(f"{f.id}: {e}")
-                if e.codigo in (403, 429):
-                    break  # la tienda nos frena: no insistir en esta ejecución
-            except Exception as e:  # cambio en la web: no debe tumbar la ejecución
-                errores.append(f"{f.id}: formato inesperado ({e.__class__.__name__}: {e})")
-    finally:
-        d.cerrar()
-    return lecturas, errores
+def _discreto(privado):
+    """En GitHub, registros discretos salvo que conste que el repo es privado:
+    ante la duda se protege la receta."""
+    return privado is False or (privado is None and bool(os.environ.get("GITHUB_ACTIONS")))
 
 
 # ---------------------------------------------------------------------------
 # Ejecución principal
 # ---------------------------------------------------------------------------
 
-def ejecutar(args):
-    global DISCRETO
-    ahora, inicio = time.time(), time.monotonic()
-    DISCRETO = os.environ.get("REPO_PRIVADO", "").strip().lower() == "false"
-    if not config.TIENDAS:
-        log("ERROR: no hay configuración privada (Secret CONFIGURACION en GitHub, o "
-            "config_privada.json en tu PC).")
-        return 1
+def preparar_telegram(args, est):
+    """Devuelve (tg, token, chat_id, codigo_salida). codigo_salida no es None
+    cuando la ejecución debe terminar ya (falta configuración o vincular el chat)."""
     token = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
     chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     if args.local and not token:
-        token, chat_id = leer_token_local()
+        token, chat_id = local.leer_token()
         if not token:
             log("Falta el token: pégalo en telegram_token.txt (carpeta del bot).")
-            return 1
-    est = estado.cargar(RUTA_ESTADO)
-    tg = None
-    if not args.sin_telegram:
-        if args.local and token and not chat_id:
-            # El chat vinculado está en el historial cifrado de la nube.
-            chat_id = est.get("dueno_chat") or chat_de_la_nube(token, est)
-            if not chat_id:
-                log("No se encontró el chat vinculado. Escribe /start al bot y espera la "
-                    "siguiente revisión de la nube, o pon tu chat id en la 2.ª línea de "
-                    "telegram_token.txt.")
-                return 1
-        if token and not chat_id:
-            # Sin TELEGRAM_CHAT_ID: se usa el chat que se vinculó con /start.
-            chat_id = est.get("dueno_chat") or vincular_dueno(token, est)
-            if not chat_id:
-                log("Esperando a que escribas /start a tu bot en Telegram para vincular tu chat.")
-                estado.guardar(est, RUTA_ESTADO)
-                return 0
-        if token and chat_id:
-            tg = Telegram(token, chat_id)
-        elif os.environ.get("GITHUB_ACTIONS"):
-            log("ERROR: falta el Secret TELEGRAM_TOKEN del repositorio.")
-            return 1
-        else:
-            log("Falta TELEGRAM_TOKEN: modo prueba (solo se muestran las alertas).")
-    # En modo prueba no se guarda nada, para no dar por avisadas alertas no enviadas.
-    guardar = tg is not None
-    if args.local and tg:
-        vigilar_nube(tg, est, ahora)
-    # Repositorio privado: 2.000 minutos gratis al mes y GitHub cobra cada
-    # ejecución redondeando al minuto, así que cada ejecución dura < 1 minuto.
-    privado = os.environ.get("REPO_PRIVADO", "").strip().lower() == "true"
-    if privado:
-        limite_descarga = inicio + config.SEGUNDOS_DESCARGA_PRIVADO
-        limite_total = inicio + config.SEGUNDOS_TOTAL_PRIVADO
-    else:
-        limite_descarga, limite_total = None, inicio + PRESUPUESTO_SEGUNDOS
+            return None, "", "", 1
+    if args.sin_telegram:
+        return None, token, chat_id, None
+    if args.local and token and not chat_id:
+        # El chat vinculado está en el historial cifrado de la nube.
+        chat_id = est.get("dueno_chat") or local.chat_de_la_nube(token, est)
+        if not chat_id:
+            log("No se encontró el chat vinculado. Escribe /start al bot y espera la "
+                "siguiente revisión de la nube, o pon tu chat id en la 2.ª línea de "
+                "telegram_token.txt.")
+            return None, token, "", 1
+    if token and not chat_id:
+        # Sin TELEGRAM_CHAT_ID: se usa el chat que se vinculó con /start.
+        chat_id = est.get("dueno_chat") or vincular_dueno(token, est)
+        if not chat_id:
+            log("Esperando a que escribas /start a tu bot en Telegram para vincular tu chat.")
+            estado.guardar(est, RUTA_ESTADO)
+            return None, token, "", 0
+    if token and chat_id:
+        return Telegram(token, chat_id), token, chat_id, None
+    if os.environ.get("GITHUB_ACTIONS"):
+        log("ERROR: falta el Secret TELEGRAM_TOKEN del repositorio.")
+        return None, token, chat_id, 1
+    log("Falta TELEGRAM_TOKEN: modo prueba (solo se muestran las alertas).")
+    return None, token, chat_id, None
 
-    tiendas = crear_tiendas(config.TIENDAS)
+
+def elegir_tiendas(args):
+    tiendas, invalidas = crear_tiendas(config.TIENDAS)
+    for clave, motivo in invalidas:
+        log(f"Tienda {clave} omitida: {motivo}", detalle=True)
+    if invalidas:
+        log(f"{len(invalidas)} tienda(s) con configuración inválida: se omiten.")
     # "solo_local": tiendas que bloquean a los servidores en la nube y se revisan
     # desde la PC del usuario (modo --local); la nube no las intenta.
     if args.local:
@@ -197,13 +117,41 @@ def ejecutar(args):
         tiendas = [t for t in tiendas if not t.cfg.get("solo_local")]
     if args.solo:
         tiendas = [t for t in tiendas if t.clave == args.solo]
+    return tiendas
+
+
+def ejecutar(args):
+    ahora, inicio = time.time(), time.monotonic()
+    privado = _repo_privado()
+    registro.discreto = _discreto(privado)
+    if not config.TIENDAS:
+        log("ERROR: no hay configuración privada (Secret CONFIGURACION en GitHub, o "
+            "config_privada.json en tu PC).")
+        return 1
+    est = estado.cargar(RUTA_ESTADO)
+    tg, token, chat_id, salida = preparar_telegram(args, est)
+    if salida is not None:
+        return salida
+    # En modo prueba no se guarda nada, para no dar por avisadas alertas no enviadas.
+    guardar = tg is not None
+    if args.local and tg:
+        local.vigilar_nube(tg, est, ahora)
+    # Repositorio privado: 2.000 minutos gratis al mes y GitHub cobra cada
+    # ejecución redondeando al minuto, así que cada ejecución dura < 1 minuto.
+    if privado:
+        limite_descarga = inicio + config.SEGUNDOS_DESCARGA_PRIVADO
+        limite_total = inicio + config.SEGUNDOS_TOTAL_PRIVADO
+    else:
+        limite_descarga, limite_total = None, inicio + PRESUPUESTO_SEGUNDOS
+
+    tiendas = elegir_tiendas(args)
     nombres = {t.clave: t.nombre for t in tiendas}
     # Tiendas que bloquearon al bot: no se insiste hasta que termine su pausa.
     en_pausa = [t for t in tiendas if est["salud"].get(t.clave, {}).get("pausa_hasta", 0) > ahora]
     activas = [t for t in tiendas if t not in en_pausa]
     tiendas_ok = 0
     escucha = None
-    if tg and not args.local:  # los comandos los atiende la nube
+    if tg and not args.local:  # los comandos los atiende solo la nube
         escucha = comandos.Escucha(Telegram(token, chat_id), est, nombres, texto_estado)
         escucha.start()
     try:
@@ -214,7 +162,7 @@ def ejecutar(args):
         con_errores = sum(1 for r in resultados.values() if r["errores"])
         log(f"Tiendas con datos: {con_datos} de {len(resultados)}"
             + (f" · {con_errores} con errores (detalle: /estado en Telegram)"
-               if con_errores and DISCRETO else "")
+               if con_errores and registro.discreto else "")
             + (f" · {len(en_pausa)} en pausa por bloqueo" if en_pausa else ""))
         evaluaciones = {}
         alertas = elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes=guardar,
@@ -227,7 +175,7 @@ def ejecutar(args):
         enviadas = enviar_alertas(tg, alertas, nombres, est, ahora, limite=limite_total)
         tiendas_ok = actualizar_salud(tg, est, resultados, nombres, ahora)
         est["ejecuciones"].append([int(ahora), len(productos), enviadas, tiendas_ok, len(tiendas)])
-        if tg and not args.local:  # el resumen lo envía la nube
+        if escucha:  # el resumen y los comandos son cosa de la nube
             try:
                 resumen_diario(tg, est, nombres, ahora)
             except ErrorTelegram as e:
@@ -237,9 +185,8 @@ def ejecutar(args):
             controlar_minutos(tg, est, ahora, time.monotonic() - inicio)
     finally:
         # Pase lo que pase, el historial y las alertas ya enviadas se guardan.
-        if escucha and escucha.is_alive():
-            escucha.terminar()
         if escucha:
+            escucha.terminar()
             escucha.tg.cerrar()
         if tg:
             tg.cerrar()
@@ -249,99 +196,6 @@ def ejecutar(args):
             log(f"Estado guardado ({len(est['productos'])} productos en historial)")
     # Si ninguna tienda revisada respondió, la ejecución se marca como fallida en GitHub.
     return 0 if tiendas_ok or not activas else 1
-
-
-def leer_token_local():
-    """Modo --local: token (1.ª línea) y, opcional, chat id (2.ª línea)."""
-    try:
-        with open(ARCHIVO_TOKEN_LOCAL, encoding="utf-8-sig") as f:
-            lineas = [l.strip() for l in f.read().splitlines() if l.strip()]
-    except OSError:
-        return "", ""
-    return (lineas[0] if lineas else ""), (lineas[1] if len(lineas) > 1 else "")
-
-
-def chat_de_la_nube(token, est):
-    """Modo --local: toma el chat vinculado del historial que guarda la nube
-    (rama pública "estado", cifrada con el token del bot)."""
-    repo = config.PRIVADA.get("repo_nube")
-    openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
-    if not repo or not os.path.exists(openssl):
-        return None
-    try:
-        r = httpx.get(f"https://raw.githubusercontent.com/{repo}/estado/estado.enc", timeout=30)
-        r.raise_for_status()
-    except httpx.HTTPError:
-        return None
-    chat = None
-    with tempfile.TemporaryDirectory() as carpeta:
-        cifrado, plano = os.path.join(carpeta, "e.enc"), os.path.join(carpeta, "e.json.gz")
-        with open(cifrado, "wb") as f:
-            f.write(r.content)
-        for clave in (token, token + "\n"):  # por si el Secret se guardó con salto de línea
-            res = subprocess.run([openssl, "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter",
-                                  "200000", "-pass", "env:CLAVE_ESTADO", "-in", cifrado,
-                                  "-out", plano], env={**os.environ, "CLAVE_ESTADO": clave},
-                                 capture_output=True, creationflags=SIN_VENTANA)
-            if res.returncode == 0:
-                chat = estado.cargar(plano).get("dueno_chat")
-                if chat:
-                    break
-    if chat:
-        est["dueno_chat"] = chat
-    return chat or None
-
-
-def vigilar_nube(tg, est, ahora):
-    """Modo --local: si la nube lleva más de 20 min sin revisar (GitHub perdió la
-    cadena), avisa una vez por Telegram con un botón para reanudarla. Usa la
-    consulta pública de GitHub: no necesita credenciales de GitHub en la PC."""
-    repo = config.PRIVADA.get("repo_nube")
-    if not repo:
-        return
-    try:
-        r = httpx.get(f"https://api.github.com/repos/{repo}/actions/workflows/bot.yml/runs",
-                      params={"per_page": 5}, timeout=30,
-                      headers={"Accept": "application/vnd.github+json"})
-        r.raise_for_status()
-        ejecuciones = r.json().get("workflow_runs") or []
-    except (httpx.HTTPError, ValueError, AttributeError):
-        return
-    if not isinstance(ejecuciones, list) or not ejecuciones:
-        return
-    activa = any(e.get("status") in ("queued", "in_progress", "waiting", "pending", "requested")
-                 for e in ejecuciones)
-    ultima = max(datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")).timestamp()
-                 for e in ejecuciones if e.get("created_at"))
-    parada = not activa and ahora - ultima > 20 * 60
-    if parada and not est.get("aviso_nube"):
-        try:
-            tg.enviar_texto(
-                "⚠️ La revisión en la nube se detuvo (GitHub no lanzó la siguiente). "
-                "Pulsa el botón, luego <b>Run workflow</b> y otra vez <b>Run workflow</b> "
-                "para reanudarla.",
-                botones={"inline_keyboard": [[{"text": "▶️ Reanudar en GitHub",
-                                               "url": f"https://github.com/{repo}/actions/workflows/bot.yml"}]]})
-            est["aviso_nube"] = int(ahora)
-            log("La nube estaba detenida: se avisó por Telegram.")
-        except ErrorTelegram as e:
-            log(f"Telegram: {e}")
-    elif not parada:
-        est.pop("aviso_nube", None)
-
-
-def preparar_local():
-    """Modo --local: estado propio de esta PC y, sin consola (tarea programada),
-    registro en datos/local.log."""
-    global RUTA_ESTADO
-    carpeta = os.path.join(DIR_BOT, "datos")
-    os.makedirs(carpeta, exist_ok=True)
-    RUTA_ESTADO = os.path.join(carpeta, "estado_local.json.gz")
-    if sys.stdout is None:
-        registro = os.path.join(carpeta, "local.log")
-        if os.path.exists(registro) and os.path.getsize(registro) > 1_000_000:
-            os.replace(registro, registro + ".1")
-        sys.stdout = sys.stderr = open(registro, "a", encoding="utf-8", buffering=1)
 
 
 def vincular_dueno(token, est):
@@ -368,333 +222,6 @@ def vincular_dueno(token, est):
     return None
 
 
-def descargar(tiendas, est, limite):
-    """Descarga todas las tiendas en paralelo (cada una a su propio ritmo)."""
-    resultados = {}
-    with ThreadPoolExecutor(max_workers=max(1, len(tiendas))) as pool:
-        trabajos = {t.clave: pool.submit(revisar_tienda, t, est["cursores"].get(t.clave, 0),
-                                         est["inicios"].get(t.clave, 0), limite)
-                    for t in tiendas}
-        for clave, tr in trabajos.items():
-            try:
-                resultados[clave] = tr.result()
-            except Exception as e:
-                resultados[clave] = {
-                    "lecturas": [], "errores": [f"error interno: {e.__class__.__name__}: {e}"],
-                    "cursor": est["cursores"].get(clave, 0), "inicio": est["inicios"].get(clave, 0),
-                    "sin_leer": 0}
-    return resultados
-
-
-def unificar(resultados, est, nombres, ahora):
-    """Un producto puede salir en varias fuentes: se cuenta una sola vez.
-
-    linea_base[clave] es True si TODAS sus fuentes se leen por primera vez."""
-    productos, linea_base = {}, {}
-    for clave, r in resultados.items():
-        est["cursores"][clave], est["inicios"][clave] = r["cursor"], r["inicio"]
-        total = sum(len(ps) for _, ps in r["lecturas"])
-        log(f"{nombres[clave]}: {len(r['lecturas'])} consultas, {total} productos, "
-            f"{len(r['errores'])} errores"
-            + (f", {r['sin_leer']} quedan para la próxima revisión" if r["sin_leer"] else ""),
-            detalle=True)
-        for err in r["errores"][:5]:
-            log(f"   ! {err}", detalle=True)
-        for fuente, ps in r["lecturas"]:
-            nueva = fuente.id not in est["fuentes"]
-            for p in ps:
-                p.origen = p.origen or fuente.id
-                if p.clave not in productos:
-                    productos[p.clave] = p
-                    linea_base[p.clave] = nueva
-                else:
-                    linea_base[p.clave] = linea_base[p.clave] and nueva
-            est["fuentes"][fuente.id] = int(ahora)
-    return productos, linea_base
-
-
-def elegir_alertas(productos, linea_base, est, ahora, marcar_pendientes, evaluaciones=None):
-    """Evalúa cada producto, registra su historial y devuelve las alertas a enviar.
-    En `evaluaciones` deja las ofertas válidas (las usan /top y /buscar)."""
-    candidatas = []
-    for clave, p in productos.items():
-        est_p = est["productos"].get(clave)
-        ev = analisis.evaluar(p, (est_p or {}).get("h"), ahora)
-        if ev is not None and evaluaciones is not None:
-            evaluaciones[clave] = ev
-        if ev and analisis.es_novedad(p, ev, est_p, linea_base[clave]):
-            candidatas.append((p, ev))
-        analisis.registrar(est["productos"].setdefault(clave, {}), p, ahora)
-
-    alertas, firmas = [], set()
-    for p, ev in sorted(candidatas, key=lambda x: (-x[1].nivel, -x[1].ahorro_pct)):
-        est_p = est["productos"][p.clave]
-        f = firma(p)
-        previo = est["avisos_recientes"].get(f)
-        otra_tienda = bool(previo) and previo[1] != p.clave
-        if f in firmas or (otra_tienda and not est_p.get("pend")):
-            # Mismo artículo ya avisado en esta ejecución o desde otra tienda.
-            est_p["a"] = {"t": int(ahora), "p": p.precio, "n": ev.nivel}
-            continue
-        firmas.add(f)
-        if marcar_pendientes:
-            # Queda pendiente hasta confirmar el envío: si algo falla a mitad
-            # de camino, se reintenta en la siguiente ejecución.
-            est_p["pend"] = 1
-        alertas.append((p, ev))
-    return alertas
-
-
-def alertas_vigiladas(productos, evaluaciones, est, ya_incluidas):
-    """Productos que coinciden con /vigilar: precio máximo pedido o, si no se dio,
-    un descuento de al menos comandos.DESCUENTO_VIGILADO. Se avisa una vez por
-    producto (otra vez solo si baja un 5 % más)."""
-    alertas = []
-    for v in list(est.get("vigilar") or []):
-        buscadas = comandos.palabras(v["q"])
-        for clave, p in productos.items():
-            if clave in ya_incluidas or p.disponible is False or p.precio <= 0:
-                continue
-            if not comandos.coincide(p.nombre, buscadas):
-                continue
-            pct = comandos.descuento(p)
-            if v.get("max") is not None:
-                if p.precio > v["max"]:
-                    continue
-            elif pct < comandos.DESCUENTO_VIGILADO:
-                continue
-            previo = v.get("avisados", {}).get(clave)
-            if previo and p.precio > previo * (1 - config.BAJADA_PARA_REAVISAR):
-                continue
-            base = evaluaciones.get(clave)
-            ev = analisis.Evaluacion(
-                nivel=base.nivel if base else analisis.GRANDE, descuento=pct,
-                caida=base.caida if base else 0.0, habitual=base.habitual if base else None,
-                referencia=max(p.precio_antes or 0, p.precio), motivos=base.motivos if base else [],
-                minimo=base.minimo if base else None, veredicto=base.veredicto if base else "",
-                vigilado=v["q"])
-            alertas.append((p, ev))
-            ya_incluidas.add(clave)
-    return alertas
-
-
-_RE_INTERES = {}
-
-
-def es_de_interes(p):
-    """¿Coincide con tus intereses (por nombre o por la categoría donde apareció)?"""
-    if not config.INTERESES:
-        return True
-    for campo, texto in (("nombre", p.nombre), ("fuente", p.origen)):
-        patron = config.INTERESES.get(campo)
-        if patron:
-            if campo not in _RE_INTERES:
-                _RE_INTERES[campo] = re.compile(patron, re.I)
-            if _RE_INTERES[campo].search(texto or ""):
-                return True
-    return False
-
-
-def es_prioritaria(p, ev):
-    """Llega sola, con foto: tus intereses, lo que vigilas, descuentos enormes o
-    posibles errores."""
-    return (bool(ev.vigilado) or es_de_interes(p) or ev.ahorro_pct >= config.DESCUENTO_PRIORITARIO
-            or ev.nivel == analisis.ERROR)
-
-
-def en_descanso(ahora):
-    """¿Estamos en el horario de descanso (hora de Lima)?"""
-    try:
-        inicio, fin = [int(h) * 60 + int(m) for h, m in
-                       (x.split(":") for x in config.DESCANSO.split("-"))]
-    except ValueError:
-        return False
-    local = datetime.fromtimestamp(ahora, LIMA)
-    minuto = local.hour * 60 + local.minute
-    return inicio <= minuto or minuto < fin if inicio > fin else inicio <= minuto < fin
-
-
-def silenciado(est, ahora):
-    """¿El usuario pidió /silencio y aún no termina?"""
-    return est.get("silencio_hasta", 0) > ahora
-
-
-def marcar_avisado(est, p, ev, ahora):
-    est_p = est["productos"].setdefault(p.clave, {})
-    est_p["a"] = {"t": int(ahora), "p": p.precio, "n": ev.nivel}
-    est_p.pop("pend", None)
-    est["avisos_recientes"][firma(p)] = [int(ahora), p.clave]
-    if ev.vigilado:
-        for v in est.get("vigilar") or []:
-            if v["q"] == ev.vigilado:
-                avisados = v.setdefault("avisados", {})
-                avisados[p.clave] = p.precio
-                if len(avisados) > 200:
-                    del avisados[next(iter(avisados))]
-    # Para /hoy: las alertas de las últimas 24 h.
-    recientes = est.setdefault("recientes", [])
-    recientes.append([int(ahora), p.nombre[:80], p.precio, round(ev.ahorro_pct, 3), p.url, p.tienda])
-    est["recientes"] = [r for r in recientes if ahora - r[0] < 86400][-150:]
-
-
-def enviar_alertas(tg, alertas, nombres, est, ahora, limite):
-    """Tus intereses, los descuentos enormes y los posibles errores van con foto y
-    botón; el resto, juntos en un mensaje-lista. Las que no se logren enviar
-    quedan pendientes ("pend") para la siguiente vez."""
-    prioritarias = [a for a in alertas if es_prioritaria(*a)]
-    otras = [a for a in alertas if not es_prioritaria(*a)]
-    individuales = prioritarias[:config.MAX_ALERTAS_POR_EJECUCION]
-    resto = sorted(prioritarias[config.MAX_ALERTAS_POR_EJECUCION:] + otras,
-                   key=lambda a: -a[1].ahorro_pct)
-    enviadas = 0
-    for p, ev in individuales:
-        if tg is None:
-            print("\n" + sin_html(texto_alerta(p, ev, nombres[p.tienda])))
-            print(f"🛒 {p.url}\n" + "-" * 60)
-            enviadas += 1
-            continue
-        if enviadas >= ALERTAS_GARANTIZADAS and time.monotonic() > limite:
-            log("Sin tiempo para más alertas: quedan pendientes para la próxima revisión.")
-            return enviadas
-        try:
-            # De noche suenan solo los posibles errores de precio de productos que
-            # no son baratos; con /silencio no suena nada.
-            alarma = ev.nivel == analisis.ERROR and ev.referencia >= config.MIN_PRECIO_REFERENCIA
-            silencioso = silenciado(est, ahora) or (en_descanso(ahora) and not alarma)
-            tg.enviar_alerta(p, ev, nombres[p.tienda], silencioso=silencioso)
-            marcar_avisado(est, p, ev, ahora)
-            enviadas += 1
-        except ErrorTelegram as e:
-            log(f"No se pudo enviar la alerta de {p.clave}: {e}", detalle=True)
-            if e.red:
-                return enviadas  # Telegram no responde: no insistir con el resto
-    if not resto:
-        return enviadas
-    lineas = [f"<b>-{ev.ahorro_pct:.0%}</b> {soles(p.precio)} · "
-              f"<a href=\"{html.escape(p.url)}\">{html.escape(p.nombre[:60])}</a> "
-              f"<i>{nombres[p.tienda]}</i>"
-              for p, ev in resto]
-    encabezado = f"📋 <b>Otras ofertas ({len(resto)})</b>"
-    if tg is None:
-        print(sin_html(encabezado + "\n" + "\n".join(lineas)))
-        return enviadas + len(resto)
-    if time.monotonic() > limite:
-        return enviadas
-    try:
-        tg.enviar_lista(encabezado, lineas, silencioso=True)  # la lista nunca suena
-    except ErrorTelegram as e:
-        log(f"No se pudo enviar el resumen: {e}")
-        return enviadas
-    for p, ev in resto:
-        marcar_avisado(est, p, ev, ahora)
-    return enviadas + len(resto)
-
-
-def actualizar_salud(tg, est, resultados, nombres, ahora):
-    ok = 0
-    for clave, r in resultados.items():
-        lecturas, errores = r["lecturas"], r["errores"]
-        if not lecturas and not errores:
-            continue  # no se alcanzó a consultar (límite de tiempo): ni éxito ni fallo
-        s = est["salud"].setdefault(clave, {"fallos": 0})
-        if lecturas:
-            ok += 1
-            if s.get("avisado") and tg:
-                avisar(tg, f"✅ {nombres[clave]} vuelve a responder con normalidad.")
-            est["salud"][clave] = {"fallos": 0, "ok": int(ahora), "errores": len(errores)}
-            continue
-        s["fallos"] = s.get("fallos", 0) + 1
-        s["error"] = (errores or ["sin datos"])[0][:200]
-        s.setdefault("desde", int(ahora))
-        bloqueo = next((m.group(0) for e in errores if (m := re.search(r"HTTP (403|429)", e))), None)
-        if bloqueo:
-            # La tienda rechaza al bot: se respeta y solo se reintenta tras una pausa.
-            s["pausa_hasta"] = int(ahora + config.PAUSA_TRAS_BLOQUEO_HORAS * 3600)
-            s["bloqueo"] = bloqueo
-            if not s.get("avisado") and tg:
-                avisar(tg, f"⏸️ <b>{nombres[clave]}</b> está bloqueando al bot ({bloqueo}). No se "
-                           f"insistirá: se reintenta cada {config.PAUSA_TRAS_BLOQUEO_HORAS} horas y "
-                           "te aviso si vuelve a responder. Las demás tiendas siguen normales.")
-                s["avisado"] = True
-            continue
-        if s["fallos"] >= config.FALLOS_PARA_AVISAR and not s.get("avisado") and tg:
-            avisar(tg, f"⚠️ <b>{nombres[clave]}</b> no responde desde las {hora_lima(s['desde'])} "
-                       f"({s['fallos']} revisiones seguidas).\nÚltimo error: {html.escape(s['error'])}")
-            s["avisado"] = True
-    return ok
-
-
-def controlar_minutos(tg, est, ahora, segundos):
-    """Estima los minutos gratis de GitHub usados en el mes (repositorio privado)
-    y avisa una vez si se acercan al límite. El dato exacto está en GitHub:
-    Settings → Billing and plans."""
-    mes = datetime.fromtimestamp(ahora, timezone.utc).strftime("%Y-%m")
-    uso = est.get("uso_mes") or {}
-    if uso.get("mes") != mes:
-        uso = {"mes": mes, "min": 0}
-    uso["min"] += math.ceil((segundos + SEGUNDOS_PREPARACION) / 60)
-    if uso["min"] >= 0.85 * config.MINUTOS_GRATIS_MES and not uso.get("avisado") and tg:
-        avisar(tg, f"⚠️ El bot lleva ~{uso['min']:,} de {config.MINUTOS_GRATIS_MES:,} minutos "
-                   "gratis de GitHub este mes. Si se agotan, se detendrá hasta el día 1 del mes "
-                   "siguiente (sin cobrarte). Revisa GitHub → Settings → Billing and plans.")
-        uso["avisado"] = True
-    est["uso_mes"] = uso
-
-
-def avisar(tg, texto):
-    try:
-        tg.enviar_texto(texto)
-    except ErrorTelegram as e:
-        log(f"Telegram: {e}")
-
-
-def texto_estado(est, nombres, ahora):
-    ej = est["ejecuciones"]
-    if ej:
-        ultima = ej[-1][0]
-        lineas = [f"✅ <b>Bot activo</b>. Última revisión: {hora_lima(ultima)} "
-                  f"(hace {int((ahora - ultima) // 60)} min)"]
-    else:
-        lineas = ["ℹ️ El bot aún no ha completado ninguna revisión."]
-    lineas.append(f"Últimas 24 h: {len(ej)} revisiones · "
-                  f"{sum(e[1] for e in ej):,} productos analizados · {sum(e[2] for e in ej)} alertas")
-    lineas.append("\n<b>Tiendas</b>")
-    for clave, nombre in nombres.items():
-        s = est["salud"].get(clave, {})
-        if s.get("pausa_hasta", 0) > ahora:
-            lineas.append(f"⏸️ {nombre}: bloquea al bot ({s.get('bloqueo', '')}); próximo intento "
-                          f"a las {hora_lima(s['pausa_hasta'])}")
-        elif s.get("fallos"):
-            lineas.append(f"⚠️ {nombre}: falla desde las {hora_lima(s.get('desde'))} — "
-                          f"{html.escape(s.get('error', '')[:80])}")
-        elif s.get("ok"):
-            lineas.append(f"✅ {nombre}: OK ({hora_lima(s['ok'])})")
-        else:
-            lineas.append(f"… {nombre}: sin datos todavía")
-    uso = est.get("uso_mes")
-    if uso:
-        lineas.append(f"\n⏱️ Minutos de GitHub este mes (estimado): {uso['min']:,} de "
-                      f"{config.MINUTOS_GRATIS_MES:,}")
-    lineas.append(f"\nUmbrales: descuento ≥ {config.MIN_DESCUENTO:.0%} · referencia ≥ "
-                  f"{soles(config.MIN_PRECIO_REFERENCIA)} (sin mínimo desde "
-                  f"{config.DESCUENTO_SIN_MINIMO:.0%}) · nivel mínimo {config.NIVEL_MINIMO}")
-    if est.get("vigilar"):
-        lineas.append(f"👁 Vigilando {len(est['vigilar'])} producto(s): /vigilados")
-    if silenciado(est, ahora):
-        lineas.append(f"🔕 Sin sonido hasta las {hora_lima(est['silencio_hasta'])}")
-    return "\n".join(lineas)
-
-
-def resumen_diario(tg, est, nombres, ahora):
-    if config.HORA_RESUMEN_DIARIO < 0:
-        return
-    local = datetime.fromtimestamp(ahora, LIMA)
-    hoy = local.strftime("%Y-%m-%d")
-    if local.hour >= config.HORA_RESUMEN_DIARIO and est.get("resumen_diario") != hoy:
-        tg.enviar_texto("☀️ <b>Resumen diario</b>\n" + texto_estado(est, nombres, ahora))
-        est["resumen_diario"] = hoy
-
-
 # ---------------------------------------------------------------------------
 # Utilidades de configuración
 # ---------------------------------------------------------------------------
@@ -705,10 +232,13 @@ def mostrar_chat_id():
         sys.exit("Define primero la variable TELEGRAM_TOKEN con el token de @BotFather.")
     tg = Telegram(token, "0")
     vistos = {}
-    for upd in tg.actualizaciones(0):
-        chat = (upd.get("message") or {}).get("chat") or {}
-        if chat.get("id"):
-            vistos[chat["id"]] = chat.get("first_name") or chat.get("title") or ""
+    try:
+        for upd in tg.actualizaciones(0):
+            chat = (upd.get("message") or {}).get("chat") or {}
+            if chat.get("id"):
+                vistos[chat["id"]] = chat.get("first_name") or chat.get("title") or ""
+    finally:
+        tg.cerrar()
     if not vistos:
         print("No hay mensajes. Abre tu bot en Telegram, pulsa INICIAR (o escribe /start) "
               "y vuelve a ejecutar este comando.")
@@ -722,13 +252,17 @@ def probar_telegram():
     if not token or not chat_id:
         sys.exit("Define TELEGRAM_TOKEN y TELEGRAM_CHAT_ID.")
     tg = Telegram(token, chat_id)
-    tg.enviar_texto("✅ Prueba correcta: el bot de ofertas puede escribirte.",
-                    botones={"inline_keyboard": [[{"text": "🛒 COMPRAR AHORA",
-                                                   "url": "https://telegram.org/"}]]})
+    try:
+        tg.enviar_texto("✅ Prueba correcta: el bot de ofertas puede escribirte.",
+                        botones={"inline_keyboard": [[{"text": "🛒 COMPRAR AHORA",
+                                                       "url": "https://telegram.org/"}]]})
+    finally:
+        tg.cerrar()
     print("Mensaje de prueba enviado. Revisa Telegram.")
 
 
 def main():
+    global RUTA_ESTADO
     parser = argparse.ArgumentParser(description="Bot de ofertas extremas (Perú)")
     parser.add_argument("--sin-telegram", action="store_true", help="no envía nada, solo muestra")
     parser.add_argument("--chat-id", action="store_true", help="muestra tu TELEGRAM_CHAT_ID")
@@ -737,15 +271,24 @@ def main():
     parser.add_argument("--local", action="store_true",
                         help='revisa en esta PC las tiendas marcadas "solo_local"')
     args = parser.parse_args()
+    registro.discreto = _discreto(_repo_privado())
     if args.local:
-        preparar_local()
+        RUTA_ESTADO = local.preparar()
     if sys.stdout and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if args.chat_id:
         return mostrar_chat_id()
     if args.probar_telegram:
         return probar_telegram()
-    sys.exit(ejecutar(args))
+    try:
+        codigo = ejecutar(args)
+    except Exception as e:
+        # Fallo imprevisto: queda en el registro (en la PC, datos/local.log) en vez
+        # de perderse; en el repositorio público, sin detalles que revelen la receta.
+        log(f"ERROR inesperado: {e.__class__.__name__}")
+        log(traceback.format_exc(), detalle=True)
+        codigo = 1
+    sys.exit(codigo)
 
 
 if __name__ == "__main__":

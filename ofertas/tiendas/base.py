@@ -7,6 +7,9 @@ from ofertas.modelos import Fuente, Producto
 from ofertas.red import Descargador
 
 
+MAX_CONEXIONES = 6
+
+
 class ErrorFormato(Exception):
     """La página no tiene el formato esperado (cambio en la web o bloqueo)."""
 
@@ -24,7 +27,8 @@ class Tienda:
         # Usar el programa curl en vez del cliente de Python (algunas tiendas
         # solo aceptan curl) y cuántas peticiones simultáneas hacer.
         self.usar_curl = bool(cfg.get("usar_curl", False))
-        self.conexiones = int(cfg.get("conexiones", 1))
+        # Tope de seguridad: un error de configuración no debe saturar la tienda.
+        self.conexiones = max(1, min(int(cfg.get("conexiones", 1)), MAX_CONEXIONES))
 
     def fuentes(self, cursor: int) -> tuple[list[Fuente], int]:
         """Fuentes a revisar en esta ejecución y el nuevo cursor (por si la tienda
